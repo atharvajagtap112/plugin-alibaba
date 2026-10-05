@@ -1,6 +1,6 @@
 # How to use the Alibaba Cloud plugin
 
-This plugin integrates Kestra flows with Alibaba Cloud. It covers OSS file transfers, MaxCompute SQL, and Simple Log Service (SLS) log ingestion, queries, and polling triggers. See the [OSS Java SDK reference](https://www.alibabacloud.com/help/en/oss/developer-reference/oss-java-sdk/) for the underlying API.
+This plugin integrates Kestra flows with Alibaba Cloud. It covers OSS file transfers, MaxCompute SQL, Simple Log Service (SLS) log ingestion, queries, and polling triggers, and Message Service (MNS) queues. See the [OSS Java SDK reference](https://www.alibabacloud.com/help/en/oss/developer-reference/oss-java-sdk/) for the underlying API.
 
 ## Authentication
 
@@ -9,7 +9,8 @@ Every task needs an AccessKey pair, and a Security Token Service (STS) token whe
 - `accessKeyId`: the AccessKey ID.
 - `accessKeySecret`: the AccessKey secret.
 - `securityToken`: optional STS token.
-- `region`: the region ID, for example `cn-hangzhou`. Default endpoints are `https://oss-<region>.aliyuncs.com`, `https://service.<region>.maxcompute.aliyun.com/api`, and `https://<region>.log.aliyuncs.com`.
+- `region`: the region ID, for example `cn-hangzhou`. Default endpoints are `https://oss-<region>.aliyuncs.com`, `https://service.<region>.maxcompute.aliyun.com/api`, `https://<region>.log.aliyuncs.com`, and `https://<accountId>.mns.<region>.aliyuncs.com`. MNS always requires `region`.
+- `accountId`: your Alibaba Cloud account ID, required by MNS unless `endpointOverride` is set.
 - `endpointOverride`: optional URL that replaces the region-derived endpoint. OSS requires https unless `pathStyleAccess` is true. MaxCompute and SLS also accept explicit http URLs for local endpoints. For SLS, specify the full service endpoint, including the project hostname for private endpoints; an explicit port is preserved. Treat it as trusted input, because signed requests and the STS token are sent to it.
 
 Role-based credentials (ECS instance roles and RAM roles) are not supported.
@@ -192,3 +193,42 @@ triggers:
 ```
 
 Both triggers use length-prefixed state keys. State commits and scheduler execution persistence are separate operations, so downstream processing should be idempotent across scheduler crashes; these triggers do not claim transactional exactly-once delivery. Cursor expiry surfaces as an error rather than resetting state and replaying logs.
+
+### MNS message bodies and delivery
+
+MNS tasks and triggers use the [MNS SDK](https://www.alibabacloud.com/help/en/mns/developer-reference/foreword), which calls the endpoint with its own HTTP client, so Kestra's HTTP client allow and deny lists do not apply to `endpointOverride`.
+
+Message bodies are sent and read as raw strings, which is what the MNS console and HTTP API use. The Java SDK's default `setMessageBody(String)` Base64-encodes bodies: decode such messages in your flow with the `base64decode` Pebble filter.
+
+Delivery is at least once. `Consume` and `Trigger` delete messages only after the ION file is stored, and `RealtimeTrigger` deletes each message only once its execution is created. A message received but not deleted, for example because the task was killed, becomes visible again after the queue's visibility timeout.
+
+### `io.kestra.plugin.alibaba.mns.Publish`
+
+Sends messages to a queue in batches of 16.
+
+- Required: `queue`, `from` (a message, a list of messages, or a `kestra://` ION file with one message per row). Each message has a `data` field (a string, or a map or list sent as JSON) and optional `delaySeconds` and `priority`.
+- Inline messages are rendered once by Kestra. Rows read from a `kestra://` file are sent as is, so file content is never evaluated as a template.
+- Outputs: `messagesCount`.
+
+### `io.kestra.plugin.alibaba.mns.Consume`
+
+Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` elapses, and stores them in an ION file.
+
+- Required: `queue`.
+- Optional: `maxDuration` (1 minute by default), `maxRecords` (at least 1), `serdeType` (`STRING` by default, or `JSON`; a body that is not valid JSON is kept as a string and logged), `autoDelete` (`true` by default).
+- Outputs: `count`, and `uri` when at least one message was received.
+
+### `io.kestra.plugin.alibaba.mns.Trigger`
+
+Polls a queue every `interval` (60 seconds by default) and starts one execution per poll that received messages, with the same options as `Consume`.
+
+- Required: `queue`.
+- Outputs: `trigger.count`, `trigger.uri`.
+
+### `io.kestra.plugin.alibaba.mns.RealtimeTrigger`
+
+Long-polls a queue and starts one execution per message. It only polls when executions are requested, so messages are never buffered without bound.
+
+- Required: `queue`.
+- Optional: `serdeType`, `autoDelete`, `waitTime` (20 seconds by default, up to 30), `batchSize` (16 by default).
+- Outputs: `trigger.data`.
