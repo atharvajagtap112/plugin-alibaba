@@ -158,7 +158,8 @@ public class List extends AbstractEcs implements RunnableTask<FetchOutput> {
 
         runContext.logger().debug("Found {} instance(s) in {}", count, regionId);
 
-        var output = FetchOutput.builder().size(count);
+        // FETCH_ONE stops paging early, so it reports the rows it returns, like other fetch tasks
+        var output = FetchOutput.builder().size(rFetchType == FetchType.FETCH_ONE ? rows.size() : count);
         switch (rFetchType) {
             case FETCH -> output.rows(rows);
             case FETCH_ONE -> output.row(rows.isEmpty() ? null : (Map<String, Object>) rows.getFirst());

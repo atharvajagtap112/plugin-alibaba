@@ -111,6 +111,27 @@ class EcsTest {
     }
 
     @Test
+    void listFetchOneReportsOneRow() throws Exception {
+        stubAction("DescribeInstances", absent(), 200, describeBody("page-2", "i-1", "web-1", "Running"));
+
+        var output = List.builder()
+            .id(IdUtils.create())
+            .type(List.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue(endpoint()))
+            .fetchType(Property.ofValue(FetchType.FETCH_ONE))
+            .build()
+            .run(runContextFactory.of(Map.of()));
+
+        assertThat(output.getSize(), is(1L));
+        assertThat(((Map<?, ?>) output.getRow()).get("InstanceId"), is("i-1"));
+        // the first page is enough, the next one is never requested
+        wireMock.verify(1, anyRequestedFor(urlPathEqualTo("/")));
+    }
+
+    @Test
     void start() throws Exception {
         stubAction("StartInstances", absent(), 200, actionBody("i-1", "200", "Stopped", "Starting"));
 
