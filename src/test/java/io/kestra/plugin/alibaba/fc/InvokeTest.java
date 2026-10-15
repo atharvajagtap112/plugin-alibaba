@@ -114,6 +114,23 @@ class InvokeTest {
     }
 
     @Test
+    void rendersPayloadOnlyOnce() throws Exception {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withBody("ok")));
+        var variables = Map.<String, Object>of("value", "{{ 1 + 1 }}");
+
+        payloadTask("{{ value }}").run(runContextFactory.of(variables));
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH)).withRequestBody(equalTo("{{ 1 + 1 }}")));
+
+        wireMock.resetRequests();
+        payloadTask(Map.of("key", "{{ value }}")).run(runContextFactory.of(variables));
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH)).withRequestBody(equalToJson("{\"key\":\"{{ 1 + 1 }}\"}")));
+
+        wireMock.resetRequests();
+        payloadTask(List.of("{{ value }}")).run(runContextFactory.of(variables));
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH)).withRequestBody(equalToJson("[\"{{ 1 + 1 }}\"]")));
+    }
+
+    @Test
     void failsWhenTheFunctionThrows() {
         wireMock.stubFor(post(urlPathEqualTo(PATH))
             .willReturn(aResponse()
