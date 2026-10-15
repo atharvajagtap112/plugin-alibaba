@@ -11,6 +11,7 @@ import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
 import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.NotNull;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -66,17 +67,19 @@ public class Trigger extends AbstractMnsTrigger implements PollingTriggerInterfa
 
     @Schema(
         title = "Max records",
-        description = "Stop a poll after consuming this many messages. At least one of `maxRecords` and `maxDuration` is required."
+        description = "Stop a poll after consuming this many messages, at least 1."
     )
     @PluginProperty(group = "execution")
     private Property<Integer> maxRecords;
 
     @Schema(
         title = "Max duration",
-        description = "Stop a poll after this duration elapses. At least one of `maxRecords` and `maxDuration` is required."
+        description = "Stop a poll after this duration elapses."
     )
+    @NotNull
     @PluginProperty(group = "execution")
-    private Property<Duration> maxDuration;
+    @Builder.Default
+    private Property<Duration> maxDuration = Property.ofValue(Consume.DEFAULT_MAX_DURATION);
 
     @Override
     public Optional<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) throws Exception {

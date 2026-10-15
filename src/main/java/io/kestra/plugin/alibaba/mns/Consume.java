@@ -26,6 +26,7 @@ import lombok.experimental.SuperBuilder;
 
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
@@ -39,7 +40,7 @@ import java.util.List;
 @NoArgsConstructor
 @Schema(
     title = "Consume messages from an MNS queue",
-    description = "Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` elapses, stores them in an ION file in internal storage and, by default, deletes them from the queue."
+    description = "Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` (1 minute by default) elapses, stores them in an ION file in internal storage and then, by default, deletes them from the queue. Delivery is at least once: messages are only deleted after the file is stored."
 )
 @Plugin(
     examples = {
@@ -76,10 +77,11 @@ import java.util.List;
 public class Consume extends AbstractMns implements RunnableTask<Consume.Output> {
     static final int BATCH_SIZE = 16;
     static final String MESSAGE_NOT_EXIST = "MessageNotExist";
+    static final Duration DEFAULT_MAX_DURATION = Duration.ofMinutes(1);
 
     @Schema(
         title = "Max records",
-        description = "Stop after consuming this many messages."
+        description = "Stop after consuming this many messages, at least 1."
     )
     @PluginProperty(group = "execution")
     private Property<Integer> maxRecords;
@@ -88,12 +90,14 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
         title = "Max duration",
         description = "Stop after this duration elapses."
     )
+    @NotNull
     @PluginProperty(group = "execution")
-    private Property<Duration> maxDuration;
+    @Builder.Default
+    private Property<Duration> maxDuration = Property.ofValue(DEFAULT_MAX_DURATION);
 
     @Schema(
         title = "Serde type",
-        description = "`STRING` keeps message bodies as text, `JSON` parses them."
+        description = "`STRING` keeps message bodies as text, `JSON` parses them. A body that is not valid JSON is kept as a string and logged."
     )
     @NotNull
     @PluginProperty(group = "processing")
@@ -102,7 +106,7 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
 
     @Schema(
         title = "Auto-delete",
-        description = "Delete messages from the queue once they are stored. When false, they become visible again after the queue's visibility timeout."
+        description = "Delete messages from the queue once the ION file is stored. When false, they become visible again after the queue's visibility timeout."
     )
     @PluginProperty(group = "processing")
     @Builder.Default
@@ -110,47 +114,69 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        if (this.maxRecords == null && this.maxDuration == null) {
-            throw new IllegalArgumentException("`maxRecords` or `maxDuration` must be set to bound the consumption");
-        }
-
         var rQueue = rQueue(runContext);
         var rMaxRecords = runContext.render(this.maxRecords).as(Integer.class).orElse(Integer.MAX_VALUE);
-        var rMaxDuration = runContext.render(this.maxDuration).as(Duration.class).orElse(null);
+        var rMaxDuration = runContext.render(this.maxDuration).as(Duration.class).orElse(DEFAULT_MAX_DURATION);
+        if (rMaxRecords < 1) {
+            throw new IllegalArgumentException("`maxRecords` must be at least 1, got " + rMaxRecords);
+        }
+        if (rMaxDuration.isNegative() || rMaxDuration.isZero()) {
+            throw new IllegalArgumentException("`maxDuration` must be positive, got " + rMaxDuration);
+        }
         var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
         var rAutoDelete = runContext.render(this.autoDelete).as(Boolean.class).orElse(true);
-        var deadline = rMaxDuration == null ? null : Instant.now().plus(rMaxDuration);
+        var deadline = Instant.now().plus(rMaxDuration);
 
-        var total = 0;
+        var handles = new ArrayList<String>();
         var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
-        try (var client = client(runContext); var output = new BufferedOutputStream(new FileOutputStream(tempFile))) {
+        try (var client = client(runContext)) {
             var queue = client.queue(rQueue);
-            while (total < rMaxRecords && (deadline == null || Instant.now().isBefore(deadline))) {
-                var messages = receive(queue, rQueue, Math.min(BATCH_SIZE, rMaxRecords - total), 1);
-                if (messages.isEmpty()) {
-                    break;
-                }
-
-                var handles = new ArrayList<String>(messages.size());
-                for (var message : messages) {
-                    FileSerde.write(output, rSerdeType.deserialize(message.getMessageBodyAsRawString()));
-                    total++;
-                    handles.add(message.getReceiptHandle());
-                }
-                if (rAutoDelete) {
-                    delete(queue, rQueue, handles);
+            try (var output = new BufferedOutputStream(new FileOutputStream(tempFile))) {
+                while (handles.size() < rMaxRecords && Instant.now().isBefore(deadline)) {
+                    var messages = receive(queue, rQueue, Math.min(BATCH_SIZE, rMaxRecords - handles.size()), 1);
+                    if (messages.isEmpty()) {
+                        break;
+                    }
+                    for (var message : messages) {
+                        FileSerde.write(output, deserialize(runContext, rSerdeType, message, rQueue));
+                        handles.add(message.getReceiptHandle());
+                    }
                 }
             }
-            output.flush();
+
+            URI uri = null;
+            if (!handles.isEmpty()) {
+                uri = runContext.storage().putFile(tempFile);
+                if (rAutoDelete) {
+                    // messages are only removed from the queue once they are safely stored
+                    for (var i = 0; i < handles.size(); i += BATCH_SIZE) {
+                        try {
+                            delete(queue, rQueue, handles.subList(i, Math.min(i + BATCH_SIZE, handles.size())));
+                        } catch (IllegalStateException e) {
+                            runContext.logger().warn(e.getMessage());
+                        }
+                    }
+                }
+            }
+
+            runContext.metric(Counter.of("mns.consume.messages", handles.size(), "queue", rQueue));
+            runContext.logger().info("Consumed {} message(s) from MNS queue '{}'", handles.size(), rQueue);
+
+            return Output.builder()
+                .count(handles.size())
+                .uri(uri)
+                .build();
         }
+    }
 
-        runContext.metric(Counter.of("mns.consume.messages", total, "queue", rQueue));
-        runContext.logger().info("Consumed {} message(s) from MNS queue '{}'", total, rQueue);
-
-        return Output.builder()
-            .count(total)
-            .uri(runContext.storage().putFile(tempFile))
-            .build();
+    static Object deserialize(RunContext runContext, SerdeType serdeType, com.aliyun.mns.model.Message message, String queue) {
+        var body = message.getMessageBodyAsRawString();
+        try {
+            return serdeType.deserialize(body);
+        } catch (IOException e) {
+            runContext.logger().warn("MNS message {} from queue '{}' is not valid {}, keeping it as a string: {}", message.getMessageId(), queue, serdeType, e.getMessage());
+            return body;
+        }
     }
 
     static List<com.aliyun.mns.model.Message> receive(CloudQueue queue, String name, int batchSize, int waitSeconds) {
@@ -202,7 +228,7 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
         @Schema(title = "Number of messages consumed")
         private final Integer count;
 
-        @Schema(title = "URI of the ION file holding the messages in internal storage")
+        @Schema(title = "URI of the ION file holding the messages in internal storage, unset when no message was received")
         private final URI uri;
     }
 }

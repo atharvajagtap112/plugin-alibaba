@@ -1,9 +1,7 @@
 package io.kestra.plugin.alibaba.mns.model;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.PluginProperty;
-import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
@@ -17,7 +15,7 @@ import lombok.extern.jackson.Jacksonized;
 public class Message implements io.kestra.core.models.tasks.Output {
     @Schema(
         title = "The message data",
-        description = "A string or a structured value (map, list) serialized to JSON before sending. Strings of inline messages are rendered at runtime, rows read from a `kestra://` file are sent as is."
+        description = "A string or a structured value (map, list) serialized to JSON before sending. Inline messages are rendered once by Kestra, rows read from a `kestra://` file are sent as is."
     )
     @PluginProperty(group = "main")
     @NotNull
@@ -37,9 +35,9 @@ public class Message implements io.kestra.core.models.tasks.Output {
     @PluginProperty(group = "advanced")
     private Integer priority;
 
-    public com.aliyun.mns.model.Message toMns(RunContext runContext, boolean render) throws IllegalVariableEvaluationException, JsonProcessingException {
+    public com.aliyun.mns.model.Message toMns() throws JsonProcessingException {
         var message = new com.aliyun.mns.model.Message();
-        message.setMessageBodyAsRawString(body(runContext, render));
+        message.setMessageBodyAsRawString(body());
         if (delaySeconds != null) {
             message.setDelaySeconds(delaySeconds);
         }
@@ -49,9 +47,9 @@ public class Message implements io.kestra.core.models.tasks.Output {
         return message;
     }
 
-    private String body(RunContext runContext, boolean render) throws IllegalVariableEvaluationException, JsonProcessingException {
+    private String body() throws JsonProcessingException {
         if (data instanceof String s) {
-            return render ? runContext.render(s) : s;
+            return s;
         }
         return JacksonMapper.ofJson(false).writeValueAsString(data);
     }

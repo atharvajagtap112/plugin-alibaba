@@ -26,11 +26,11 @@ import lombok.experimental.SuperBuilder;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 
-import java.io.IOException;
 import java.time.Duration;
-import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuperBuilder
@@ -40,7 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @NoArgsConstructor
 @Schema(
     title = "Trigger a flow for each MNS queue message",
-    description = "Long-polls an MNS queue and starts one execution per message as soon as it arrives, with the message body available as `trigger.data`. Use `Trigger` to process messages in batches."
+    description = "Long-polls an MNS queue and starts one execution per message, with the message body available as `trigger.data`. " +
+        "It only polls when executions are requested, and deletes a message once its execution is created, so delivery is at least once. " +
+        "Use `Trigger` to process messages in batches."
 )
 @Plugin(
     examples = {
@@ -73,6 +75,7 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
     private static final Duration BACKOFF_BASE = Duration.ofSeconds(1);
     private static final Duration BACKOFF_MAX = Duration.ofSeconds(30);
     private static final Duration SLEEP_SLICE = Duration.ofMillis(200);
+    private static final Duration KILL_TIMEOUT = Duration.ofMinutes(1);
     private static final Set<String> FATAL_ERROR_CODES = Set.of("AccessDenied", "QueueNotExist", "InvalidAccessKeyId", "SignatureDoesNotMatch");
 
     @Schema(
@@ -93,23 +96,43 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
 
     @Builder.Default
     @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private final AtomicBoolean isActive = new AtomicBoolean(true);
 
     @Builder.Default
     @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicBoolean started = new AtomicBoolean(false);
+
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private final CountDownLatch waitForTermination = new CountDownLatch(1);
 
     @Override
     public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) throws Exception {
         var runContext = conditionContext.getRunContext();
-        var task = consumeTask().build();
 
-        return publisher(task, runContext)
-            .map(message -> TriggerService.generateRealtimeExecution(this, conditionContext, context, message));
+        return publisher(consumeTask().build(), runContext)
+            .map(received -> {
+                var execution = TriggerService.generateRealtimeExecution(this, conditionContext, context, received.message());
+                received.ack().run();
+                return execution;
+            });
     }
 
-    Flux<Message> publisher(Consume task, RunContext runContext) {
+    /**
+     * A received message with the callback deleting it from the queue, called once its execution exists.
+     */
+    record Received(Message message, Runnable ack) {
+    }
+
+    Flux<Received> publisher(Consume task, RunContext runContext) {
         return Flux.create(sink -> {
+            started.set(true);
             var logger = runContext.logger();
             var signalledError = false;
             try (var client = task.client(runContext)) {
@@ -123,29 +146,30 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
                 logger.info("Starting MNS consumption from queue '{}'", rQueue);
                 var backoff = BACKOFF_BASE;
                 while (isActive.get()) {
+                    // only poll when executions are requested, so received messages never pile up in memory
+                    var requested = sink.requestedFromDownstream();
+                    if (requested <= 0) {
+                        sleep(SLEEP_SLICE);
+                        continue;
+                    }
+
                     try {
-                        var messages = Consume.receive(queue, rQueue, rBatchSize, rWaitSeconds);
+                        var messages = Consume.receive(queue, rQueue, (int) Math.min(rBatchSize, requested), rWaitSeconds);
                         backoff = BACKOFF_BASE;
-
-                        var handles = new ArrayList<String>(messages.size());
                         for (var message : messages) {
-                            Object body;
-                            try {
-                                body = rSerdeType.deserialize(message.getMessageBodyAsRawString());
-                            } catch (IOException e) {
-                                logger.warn("Unable to deserialize MNS message {}, emitting it as a string: {}", message.getMessageId(), e.getMessage());
-                                body = message.getMessageBodyAsRawString();
-                            }
-                            sink.next(Message.builder().data(body).build());
-                            handles.add(message.getReceiptHandle());
-                        }
-
-                        if (rAutoDelete && !handles.isEmpty()) {
-                            try {
-                                Consume.delete(queue, rQueue, handles);
-                            } catch (IllegalStateException e) {
-                                logger.warn(e.getMessage());
-                            }
+                            var data = Consume.deserialize(runContext, rSerdeType, message, rQueue);
+                            var handle = message.getReceiptHandle();
+                            Runnable ack = () -> {
+                                if (!rAutoDelete) {
+                                    return;
+                                }
+                                try {
+                                    Consume.delete(queue, rQueue, List.of(handle));
+                                } catch (RuntimeException e) {
+                                    logger.warn("{}", e.getMessage());
+                                }
+                            };
+                            sink.next(new Received(Message.builder().data(data).build(), ack));
                         }
                     } catch (IllegalStateException e) {
                         if (FATAL_ERROR_CODES.contains(errorCode(e.getCause()))) {
@@ -196,9 +220,10 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
         if (!isActive.compareAndSet(true, false)) {
             return;
         }
-        if (wait) {
+        // never subscribed: there is no polling loop to wait for
+        if (wait && started.get()) {
             try {
-                this.waitForTermination.await();
+                this.waitForTermination.await(KILL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

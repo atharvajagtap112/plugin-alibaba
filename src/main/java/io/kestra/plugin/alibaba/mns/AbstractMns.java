@@ -47,22 +47,17 @@ public abstract class AbstractMns extends AbstractConnection {
     @PluginProperty(group = "main")
     protected Property<String> queue;
 
-    protected static String required(RunContext runContext, Property<String> property, String name) throws IllegalVariableEvaluationException {
-        return runContext.render(property).as(String.class)
-            .orElseThrow(() -> new IllegalArgumentException("`" + name + "` is required"));
-    }
-
     protected String rQueue(RunContext runContext) throws IllegalVariableEvaluationException {
         return required(runContext, this.queue, "queue");
     }
 
     protected Client client(RunContext runContext) throws IllegalVariableEvaluationException {
-        var regionId = required(runContext, this.region, "region");
+        var regionId = renderedRegion(runContext);
         if (!REGION_PATTERN.matcher(regionId).matches()) {
             throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + regionId);
         }
 
-        var override = runContext.render(this.endpointOverride).as(String.class).orElse(null);
+        var override = renderedEndpoint(runContext);
         String endpoint;
         if (override == null) {
             var account = required(runContext, this.accountId, "accountId");
@@ -78,9 +73,9 @@ public abstract class AbstractMns extends AbstractConnection {
             endpoint = override;
         }
 
-        var id = required(runContext, this.accessKeyId, "accessKeyId");
-        var secret = required(runContext, this.accessKeySecret, "accessKeySecret");
-        var token = runContext.render(this.securityToken).as(String.class).orElse(null);
+        var id = renderedAccessKeyId(runContext);
+        var secret = renderedAccessKeySecret(runContext);
+        var token = renderedSecurityToken(runContext);
         var credentials = token == null ? new BasicCredentials(id, secret) : new BasicSessionCredentials(id, secret, token);
 
         // credentials go through a provider: the SDK logs the AccessKey arguments of CloudAccount in clear text at DEBUG level

@@ -19,15 +19,15 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
-import java.io.BufferedReader;
 import java.io.FileOutputStream;
-import java.io.InputStreamReader;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -46,7 +46,9 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 @KestraTest
 class MnsTest {
@@ -140,6 +142,17 @@ class MnsTest {
     }
 
     @Test
+    void publishRendersInlineDataOnlyOnce() throws Exception {
+        stubPublishOk();
+
+        publish(Property.ofValue("cn-hangzhou"), List.of(Map.of("data", "{{ payload }}")))
+            .run(runContextFactory.of(Map.of("payload", "{{ 1 + 1 }}")));
+
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH))
+            .withRequestBody(containing("<MessageBody>{{ 1 + 1 }}</MessageBody>")));
+    }
+
+    @Test
     void publishFailsOnAccessDenied() {
         wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(error(403, "AccessDenied")));
 
@@ -158,8 +171,9 @@ class MnsTest {
         var output = consume().serdeType(Property.ofValue(SerdeType.JSON)).maxRecords(Property.ofValue(10)).build().run(runContext);
 
         assertThat(output.getCount(), is(2));
-        try (var reader = new BufferedReader(new InputStreamReader(runContext.storage().getFile(output.getUri())))) {
-            var rows = FileSerde.readAll(reader).collectList().block();
+        try (var stream = runContext.storage().getFile(output.getUri())) {
+            var rows = new ArrayList<Object>();
+            FileSerde.read(stream, rows::add);
             assertThat(rows, hasSize(2));
             assertThat(((Map<?, ?>) rows.getFirst()).get("orderId"), is(1));
         }
@@ -179,10 +193,38 @@ class MnsTest {
     }
 
     @Test
-    void consumeRequiresABound() {
-        var e = assertThrows(IllegalArgumentException.class, () -> consume().build().run(runContextFactory.of(Map.of())));
+    void consumeRejectsZeroMaxRecords() {
+        var e = assertThrows(IllegalArgumentException.class, () -> consume().maxRecords(Property.ofValue(0)).build().run(runContextFactory.of(Map.of())));
 
-        assertThat(e.getMessage(), containsString("`maxRecords` or `maxDuration` must be set"));
+        assertThat(e.getMessage(), containsString("`maxRecords` must be at least 1"));
+    }
+
+    @Test
+    void consumeStoresNothingOnEmptyQueue() throws Exception {
+        wireMock.stubFor(get(urlPathEqualTo(PATH)).willReturn(error(404, "MessageNotExist")));
+
+        var output = consume().build().run(runContextFactory.of(Map.of()));
+
+        assertThat(output.getCount(), is(0));
+        assertThat(output.getUri(), nullValue());
+    }
+
+    @Test
+    void consumeKeepsInvalidJsonAsString() throws Exception {
+        stubReceive(messagesXml("not json", "{\"orderId\":2}"));
+        wireMock.stubFor(delete(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(204)));
+
+        var runContext = runContextFactory.of(Map.of());
+        var output = consume().serdeType(Property.ofValue(SerdeType.JSON)).build().run(runContext);
+
+        assertThat(output.getCount(), is(2));
+        try (var stream = runContext.storage().getFile(output.getUri())) {
+            var rows = new ArrayList<Object>();
+            FileSerde.read(stream, rows::add);
+            assertThat(rows.getFirst(), is("not json"));
+            assertThat(((Map<?, ?>) rows.get(1)).get("orderId"), is(2));
+        }
+        wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH)).withRequestBody(containing("handle-0")));
     }
 
     @Test
@@ -246,18 +288,62 @@ class MnsTest {
             .build();
 
         try {
-            var messages = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+            var executions = Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
                 .subscribeOn(Schedulers.boundedElastic())
                 .take(2)
                 .collectList()
                 .block(Duration.ofSeconds(30));
 
-            assertThat(messages, hasSize(2));
-            assertThat(((Map<?, ?>) messages.get(1).getData()).get("orderId"), is(2));
+            assertThat(executions, hasSize(2));
+            assertThat(((Map<?, ?>) executions.get(1).getTrigger().getVariables().get("data")).get("orderId"), is(2));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
         } finally {
             trigger.kill();
         }
+        wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH)).withRequestBody(containing("handle-0")));
         wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH)).withRequestBody(containing("handle-1")));
+    }
+
+    @Test
+    void realtimeTriggerDoesNotDeleteBeforeTheExecutionExists() {
+        stubReceive(messagesXml("hello"));
+        wireMock.stubFor(delete(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(204)));
+
+        var trigger = realtimeTrigger();
+        try {
+            var received = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .take(1)
+                .collectList()
+                .block(Duration.ofSeconds(30));
+
+            assertThat(received, hasSize(1));
+        } finally {
+            trigger.kill();
+        }
+        wireMock.verify(0, deleteRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void realtimeTriggerKillBeforeStartDoesNotBlock() {
+        var trigger = realtimeTrigger();
+
+        assertTimeoutPreemptively(Duration.ofSeconds(5), trigger::kill);
+    }
+
+    private RealtimeTrigger realtimeTrigger() {
+        return RealtimeTrigger.builder()
+            .id(IdUtils.create())
+            .type(RealtimeTrigger.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue(endpoint()))
+            .queue(Property.ofValue("orders"))
+            .waitTime(Property.ofValue(Duration.ofSeconds(1)))
+            .build();
     }
 
     @Test
