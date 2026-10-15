@@ -95,7 +95,8 @@ import java.util.regex.Pattern;
 public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Output> {
     private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("^[0-9]+$");
-    private static final int MAX_BODY_OUTPUT_BYTES = 1024 * 1024;
+    // well below Kestra 2.0's default 1 MiB queue message limit, which the whole task result must fit in
+    private static final int MAX_BODY_OUTPUT_BYTES = 512 * 1024;
     private static final int MAX_ERROR_EXCERPT_BYTES = 1024;
 
     @Schema(
@@ -288,7 +289,7 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
 
         @Schema(
             title = "Response body as text",
-            description = "Only set when the response is at most 1 MB, use `uri` for larger responses. Empty for asynchronous invocations."
+            description = "Only set when the response is at most 512 KB, use `uri` for larger responses. Empty for asynchronous invocations."
         )
         private final String body;
 

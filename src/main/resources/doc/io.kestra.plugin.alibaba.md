@@ -200,4 +200,4 @@ Invokes a [Function Compute 3.0](https://www.alibabacloud.com/help/en/functionco
 
 - Required: `functionName`, and `accountId` unless `endpointOverride` is set.
 - Optional: `payload` (a map, list, number or boolean sent as JSON, or a string sent as is), `invocationType` (`SYNC` by default, or `ASYNC` to queue the event and return immediately), `qualifier` (version or alias, `LATEST` by default).
-- Outputs: `statusCode`, `requestId`, `uri` (the response body in internal storage), and `body` (the response as text, only when it is at most 1 MB; empty for `ASYNC`).
+- Outputs: `statusCode`, `requestId`, `uri` (the response body in internal storage), and `body` (the response as text, only when it is at most 512 KB; empty for `ASYNC`).
