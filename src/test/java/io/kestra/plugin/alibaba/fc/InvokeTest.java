@@ -13,6 +13,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -96,6 +97,20 @@ class InvokeTest {
 
         assertThat(e.getMessage(), containsString("resize-image"));
         assertThat(e.getMessage(), containsString("404"));
+    }
+
+    @Test
+    void sendsListAndStringPayloads() throws Exception {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withBody("ok")));
+
+        var list = payloadTask(List.of(1, 2));
+        list.run(runContext());
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH)).withRequestBody(equalToJson("[1,2]")));
+
+        wireMock.resetRequests();
+        var text = payloadTask("{{ 'hello' | upper }}");
+        text.run(runContext());
+        wireMock.verify(postRequestedFor(urlPathEqualTo(PATH)).withRequestBody(equalTo("HELLO")));
     }
 
     @Test
@@ -184,6 +199,18 @@ class InvokeTest {
 
     private RunContext runContext() {
         return runContextFactory.of(Map.of());
+    }
+
+    private static Invoke payloadTask(Object payload) {
+        return Invoke.builder()
+            .id(IdUtils.create())
+            .type(Invoke.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .endpointOverride(Property.ofValue("http://127.0.0.1:" + wireMock.port()))
+            .functionName(Property.ofValue("resize-image"))
+            .payload(Property.ofValue(payload))
+            .build();
     }
 
     private static Invoke task(Invoke.InvocationType type) {

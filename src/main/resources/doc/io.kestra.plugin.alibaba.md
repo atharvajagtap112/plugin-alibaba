@@ -199,5 +199,5 @@ Both triggers use length-prefixed state keys. State commits and scheduler execut
 Invokes a [Function Compute 3.0](https://www.alibabacloud.com/help/en/functioncompute/fc-3-0/developer-reference/sdk-reference-20230330) function. The task fails on a non-2xx response, and also when the function itself throws, which Function Compute reports with status 200 and an `X-Fc-Error-Type` header.
 
 - Required: `functionName`, and `accountId` unless `endpointOverride` is set.
-- Optional: `payload` (map sent as JSON), `invocationType` (`SYNC` by default, or `ASYNC` to queue the event and return immediately), `qualifier` (version or alias, `LATEST` by default).
+- Optional: `payload` (a map, list, number or boolean sent as JSON, or a string sent as is), `invocationType` (`SYNC` by default, or `ASYNC` to queue the event and return immediately), `qualifier` (version or alias, `LATEST` by default).
 - Outputs: `statusCode`, `requestId`, `uri` (the response body in internal storage), and `body` (the response as text, only when it is at most 1 MB; empty for `ASYNC`).

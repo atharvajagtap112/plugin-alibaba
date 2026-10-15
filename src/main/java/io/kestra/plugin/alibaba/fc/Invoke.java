@@ -7,6 +7,7 @@ import com.aliyun.fc20230330.models.InvokeFunctionResponse;
 import com.aliyun.tea.TeaException;
 import com.aliyun.teaopenapi.models.Config;
 import com.aliyun.teautil.models.RuntimeOptions;
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -31,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -120,10 +122,11 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
 
     @Schema(
         title = "Payload",
-        description = "The event sent to the function, serialized as JSON."
+        description = "The event sent to the function. A map, list, number or boolean is serialized as JSON, and a string is sent as is, so a rendered JSON text or plain text event can be passed directly.",
+        anyOf = {Map.class, java.util.List.class, String.class, Number.class, Boolean.class}
     )
     @PluginProperty(group = "main")
-    private Property<Map<String, Object>> payload;
+    private Property<Object> payload;
 
     @Schema(
         title = "Invocation type",
@@ -137,8 +140,12 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
     public Output run(RunContext runContext) throws Exception {
         var function = required(runContext, this.functionName, "functionName");
         var type = runContext.render(this.invocationType).as(InvocationType.class).orElse(InvocationType.SYNC);
-        var event = runContext.render(this.payload).asMap(String.class, Object.class);
-        var body = event.isEmpty() ? new byte[0] : JacksonMapper.ofJson().writeValueAsBytes(event);
+        var event = render(runContext, runContext.render(this.payload).as(Object.class).orElse(null));
+        var body = switch (event) {
+            case null -> new byte[0];
+            case String text -> text.getBytes(StandardCharsets.UTF_8);
+            default -> JacksonMapper.ofJson().writeValueAsBytes(event);
+        };
 
         var request = new InvokeFunctionRequest()
             .setBody(new ByteArrayInputStream(body))
@@ -182,6 +189,22 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
             .body(text)
             .requestId(requestId)
             .build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object render(RunContext runContext, Object value) throws IllegalVariableEvaluationException {
+        return switch (value) {
+            case String text -> runContext.render(text);
+            case Map<?, ?> map -> runContext.render((Map<String, Object>) map);
+            case java.util.List<?> list -> {
+                var rendered = new ArrayList<Object>(list.size());
+                for (var item : list) {
+                    rendered.add(render(runContext, item));
+                }
+                yield rendered;
+            }
+            case null, default -> value;
+        };
     }
 
     private static String header(InvokeFunctionResponse response, String name) {
