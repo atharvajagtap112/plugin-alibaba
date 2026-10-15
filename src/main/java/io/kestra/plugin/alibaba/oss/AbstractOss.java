@@ -52,11 +52,6 @@ public abstract class AbstractOss extends AbstractConnection {
         return required(runContext, this.bucket, "bucket");
     }
 
-    protected static String required(RunContext runContext, Property<String> property, String name) throws IllegalVariableEvaluationException {
-        return runContext.render(property).as(String.class)
-            .orElseThrow(() -> new IllegalArgumentException("`" + name + "` is required"));
-    }
-
     protected Client client(RunContext runContext) throws IllegalVariableEvaluationException {
         var endpoint = runContext.render(this.endpointOverride).as(String.class).orElse(null);
         if (endpoint == null) {

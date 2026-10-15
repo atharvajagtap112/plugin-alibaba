@@ -40,7 +40,11 @@
 ## What
 
 - Provides plugin components under `io.kestra.plugin.alibaba`.
-- Includes the OSS tasks `Upload`, `Download`, `List`, `Delete` and `Copy`, and a `Trigger` that starts a flow when objects appear in a bucket.
+- OSS: `Upload`, `Download`, `List`, `Delete`, and `Copy` manage objects; `Trigger` starts flows when objects appear in a bucket.
+- MaxCompute: `Query` runs SQL with fetch/store modes and remote cancellation; `Trigger` tracks new rows using typed watermarks.
+- SLS: `Query` searches logs, `Push` ingests structured data, and `Trigger` consumes new logs with persisted shard cursors.
+
+See [plugin documentation](src/main/resources/doc/io.kestra.plugin.alibaba.md) for connection options and examples.
 
 ## Usage
 

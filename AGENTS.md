@@ -3,12 +3,12 @@
 ## What
 
 - Provides plugin components under `io.kestra.plugin.alibaba`.
-- Includes classes such as `Upload`, `Download`, `List`, `Delete`, `Copy`, `Trigger`.
+- Includes OSS `Upload`, `Download`, `List`, `Delete`, `Copy`, and `Trigger`, MaxCompute `Query` and `Trigger`, and SLS `Query`, `Push`, and `Trigger`.
 
 ## Why
 
-- This plugin integrates Kestra with Alibaba Cloud OSS.
-- It moves files between Kestra internal storage and OSS buckets with typed properties, secret masking and outputs that plug into downstream tasks.
+- This plugin integrates Kestra with Alibaba Cloud OSS, MaxCompute, and Simple Log Service.
+- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. MaxCompute and SLS polling triggers persist typed watermarks or shard cursors in namespace KV.
 
 ## How
 
@@ -17,10 +17,12 @@
 Single-module plugin. Source packages under `io.kestra.plugin.alibaba`:
 
 - `oss`
+- `maxcompute`
+- `sls`
 
 The root package holds the shared connection base (`AlibabaConnectionInterface`, `AbstractConnection`). The `oss` package holds `AbstractOss`, which builds the OSS client, and the tasks.
 
-Tests run against a WireMock server standing in for the OSS endpoint, so no cloud credentials are needed.
+Tests exercise OSS, MaxCompute instance/result-tunnel APIs, and SLS endpoints through WireMock, so no cloud credentials are needed.
 
 ### Key Plugin Classes
 
@@ -30,6 +32,11 @@ Tests run against a WireMock server standing in for the OSS endpoint, so no clou
 - `io.kestra.plugin.alibaba.oss.Delete`
 - `io.kestra.plugin.alibaba.oss.Copy`
 - `io.kestra.plugin.alibaba.oss.Trigger`
+- `io.kestra.plugin.alibaba.maxcompute.Query`
+- `io.kestra.plugin.alibaba.maxcompute.Trigger`
+- `io.kestra.plugin.alibaba.sls.Query`
+- `io.kestra.plugin.alibaba.sls.Push`
+- `io.kestra.plugin.alibaba.sls.Trigger`
 
 ### Project Structure
 

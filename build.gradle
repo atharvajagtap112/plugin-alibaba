@@ -50,12 +50,39 @@ dependencies {
     compileOnly group: "io.kestra", name: "core", version: kestraVersion
     compileOnly group: "io.kestra", name: "script", version: kestraVersion
 
+    implementation("com.aliyun.odps:odps-sdk-core:0.61.2-public") {
+        exclude group: "com.squareup.okhttp3"
+        exclude group: "org.codehaus.jackson"
+        exclude group: "commons-logging"
+        exclude group: "io.netty", module: "netty-all"
+        exclude group: "com.aliyun", module: "aliyun-java-auth"
+        exclude group: "com.aliyun", module: "credentials-java"
+        exclude group: "com.aliyun", module: "tea"
+        exclude group: "org.antlr", module: "antlr4"
+        exclude group: "org.apache.arrow", module: "arrow-memory-netty"
+    }
+
+    implementation "com.aliyun.openservices:aliyun-log:0.6.166"
     implementation("com.aliyun.oss:aliyun-sdk-oss:3.18.2") {
         exclude group: "com.aliyun", module: "aliyun-java-sdk-core"
         exclude group: "com.aliyun", module: "aliyun-java-sdk-ram"
         exclude group: "com.aliyun", module: "aliyun-java-sdk-kms"
         exclude group: "com.aliyun", module: "aliyun-java-sdk-ecs"
     }
+    constraints {
+        implementation("at.yawk.lz4:lz4-java:1.12.0") {
+            because "Fixes the compression advisories affecting the SDK's LZ4 default"
+        }
+    }
+}
+
+configurations.configureEach {
+    // These patched transports are relocated; the enforced platform otherwise selects vulnerable versions.
+    resolutionStrategy.force(
+        "org.apache.httpcomponents.client5:httpclient5:5.6.5",
+        "org.apache.httpcomponents.core5:httpcore5:5.4.4",
+        "org.apache.httpcomponents.core5:httpcore5-h2:5.4.4"
+    )
 }
 
 
@@ -92,6 +119,7 @@ dependencies {
 
     // test
     testImplementation "org.junit.jupiter:junit-jupiter-engine"
+    testImplementation "org.mockito:mockito-core"
     testImplementation "org.hamcrest:hamcrest"
     testImplementation "org.hamcrest:hamcrest-library"
 
@@ -170,7 +198,40 @@ jar {
 
 shadowJar {
     archiveClassifier.set(null)
+    filesMatching('META-INF/services/**') {
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+    dependencies {
+        exclude(dependency('com.fasterxml.jackson.*:.*'))
+        exclude(dependency('io.opentelemetry:.*'))
+        exclude(dependency('org.slf4j:.*'))
+    }
     mergeServiceFiles()
+    relocate "com.aliyun.odps", "io.kestra.plugin.alibaba.shaded.odps"
+    relocate "com.aliyun.openservices", "io.kestra.plugin.alibaba.shaded.openservices"
+    relocate "com.aliyun.credentials", "io.kestra.plugin.alibaba.shaded.credentials"
+    relocate "org.apache.arrow", "io.kestra.plugin.alibaba.shaded.arrow"
+    relocate "com.google.protobuf", "io.kestra.plugin.alibaba.shaded.protobuf"
+    relocate "com.alibaba.fastjson", "io.kestra.plugin.alibaba.shaded.fastjson"
+    relocate "org.apache.http", "io.kestra.plugin.alibaba.shaded.http"
+    relocate "org.apache.hc", "io.kestra.plugin.alibaba.shaded.hc"
+    relocate "org.simpleframework", "io.kestra.plugin.alibaba.shaded.simpleframework"
+}
+
+tasks.register('verifyPluginJar', Test) {
+    description = 'Runs service integration tests against the packaged plugin instead of main class directories.'
+    group = 'verification'
+    dependsOn testClasses
+    def artifact = providers.gradleProperty('pluginJar')
+    if (!artifact.isPresent()) {
+        dependsOn jar, shadowJar
+    }
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = files(sourceSets.test.output, artifact.isPresent() ? files(artifact.get()) : shadowJar.archiveFile) + configurations.testRuntimeClasspath
+    useJUnitPlatform()
+    filter {
+        excludeTestsMatching '*.cancellationDuringSubmissionStopsReturnedInstanceOnce'
+    }
 }
 
 /**********************************************************************************************************************\
