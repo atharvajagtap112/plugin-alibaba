@@ -40,7 +40,7 @@ import java.util.List;
 @NoArgsConstructor
 @Schema(
     title = "Consume messages from an MNS queue",
-    description = "Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` (1 minute by default) elapses, stores them in an ION file in internal storage and then, by default, deletes them from the queue. Delivery is at least once: messages are only deleted after the file is stored."
+    description = "Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` (20 seconds by default) elapses, stores them in an ION file in internal storage and then, by default, deletes them from the queue. Delivery is at least once: messages are only deleted after the file is stored."
 )
 @Plugin(
     examples = {
@@ -77,7 +77,7 @@ import java.util.List;
 public class Consume extends AbstractMns implements RunnableTask<Consume.Output> {
     static final int BATCH_SIZE = 16;
     static final String MESSAGE_NOT_EXIST = "MessageNotExist";
-    static final Duration DEFAULT_MAX_DURATION = Duration.ofMinutes(1);
+    static final Duration DEFAULT_MAX_DURATION = Duration.ofSeconds(20);
 
     @Schema(
         title = "Max records",
@@ -88,7 +88,7 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
 
     @Schema(
         title = "Max duration",
-        description = "Stop after this duration elapses."
+        description = "Stop after this duration elapses. Keep it below the queue's visibility timeout (30 seconds by default): messages are deleted at the end of the run, and a message whose receipt handle expired in the meantime is delivered again."
     )
     @NotNull
     @PluginProperty(group = "execution")

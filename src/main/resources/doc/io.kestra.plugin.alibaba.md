@@ -200,7 +200,7 @@ MNS tasks and triggers use the [MNS SDK](https://www.alibabacloud.com/help/en/mn
 
 Message bodies are sent and read as raw strings, which is what the MNS console and HTTP API use. The Java SDK's default `setMessageBody(String)` Base64-encodes bodies: decode such messages in your flow with the `base64decode` Pebble filter.
 
-Delivery is at least once. `Consume` and `Trigger` delete messages only after the ION file is stored, and `RealtimeTrigger` deletes each message only once its execution is created. A message received but not deleted, for example because the task was killed, becomes visible again after the queue's visibility timeout.
+`Consume` stores the received messages first and only then deletes them, so the stored file always holds every deleted message. Keep `maxDuration` below the queue's visibility timeout (30 seconds by default): a message whose receipt handle expired before the deletion is delivered again, and the failed deletion is logged as a warning. `Trigger` deletes the messages once the file is stored, before the scheduler saves the execution, so a failure in between loses them; set `autoDelete: false` to keep them in the queue until their visibility timeout ends. `RealtimeTrigger` deletes the messages of a poll once Kestra has taken them and requests more, so a stop or kill never deletes a message that was not handed over, although a crash right after the hand-over can still lose it.
 
 ### `io.kestra.plugin.alibaba.mns.Publish`
 
@@ -215,7 +215,7 @@ Sends messages to a queue in batches of 16.
 Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` elapses, and stores them in an ION file.
 
 - Required: `queue`.
-- Optional: `maxDuration` (1 minute by default), `maxRecords` (at least 1), `serdeType` (`STRING` by default, or `JSON`; a body that is not valid JSON is kept as a string and logged), `autoDelete` (`true` by default).
+- Optional: `maxDuration` (20 seconds by default), `maxRecords` (at least 1), `serdeType` (`STRING` by default, or `JSON`; a body that is not valid JSON is kept as a string and logged), `autoDelete` (`true` by default).
 - Outputs: `count`, and `uri` when at least one message was received.
 
 ### `io.kestra.plugin.alibaba.mns.Trigger`
@@ -230,5 +230,5 @@ Polls a queue every `interval` (60 seconds by default) and starts one execution 
 Long-polls a queue and starts one execution per message. It only polls when executions are requested, so messages are never buffered without bound.
 
 - Required: `queue`.
-- Optional: `serdeType`, `autoDelete`, `waitTime` (20 seconds by default, up to 30), `batchSize` (16 by default).
+- Optional: `serdeType`, `autoDelete`, `waitTime` (20 seconds by default, from 1 to 30), `batchSize` (16 by default).
 - Outputs: `trigger.data`.

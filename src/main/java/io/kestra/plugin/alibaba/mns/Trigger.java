@@ -29,7 +29,9 @@ import java.util.Optional;
 @NoArgsConstructor
 @Schema(
     title = "Trigger a flow on MNS queue messages",
-    description = "Polls an MNS queue on an interval and starts one execution per poll that received messages. The messages are stored in an ION file available as `trigger.uri`, and their number as `trigger.count`. Use `RealtimeTrigger` for one execution per message."
+    description = "Polls an MNS queue on an interval and starts one execution per poll that received messages. The messages are stored in an ION file available as `trigger.uri`, and their number as `trigger.count`. " +
+        "Messages are deleted once the file is stored, before the scheduler saves the execution, so a failure in between loses them: set `autoDelete: false` to keep them in the queue until they become visible again. " +
+        "Use `RealtimeTrigger` for one execution per message."
 )
 @Plugin(
     examples = {
@@ -74,7 +76,7 @@ public class Trigger extends AbstractMnsTrigger implements PollingTriggerInterfa
 
     @Schema(
         title = "Max duration",
-        description = "Stop a poll after this duration elapses."
+        description = "Stop a poll after this duration elapses, 20 seconds by default. Keep it below the queue's visibility timeout (30 seconds by default), otherwise messages received early in the poll may be delivered again."
     )
     @NotNull
     @PluginProperty(group = "execution")

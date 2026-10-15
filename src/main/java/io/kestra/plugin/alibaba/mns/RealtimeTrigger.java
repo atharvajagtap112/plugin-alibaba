@@ -27,7 +27,7 @@ import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 
 import java.time.Duration;
-import java.util.List;
+import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Schema(
     title = "Trigger a flow for each MNS queue message",
     description = "Long-polls an MNS queue and starts one execution per message, with the message body available as `trigger.data`. " +
-        "It only polls when executions are requested, and deletes a message once its execution is created, so delivery is at least once. " +
+        "It only polls when executions are requested, and deletes the messages of a poll once Kestra has taken them and requests more, so a stop or kill never deletes a message that was not handed over. " +
         "Use `Trigger` to process messages in batches."
 )
 @Plugin(
@@ -80,7 +80,7 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
 
     @Schema(
         title = "Wait time",
-        description = "How long each long-poll request waits for messages, up to 30 seconds."
+        description = "How long each long-poll request waits for messages, from 1 to 30 seconds."
     )
     @PluginProperty(group = "advanced")
     @Builder.Default
@@ -117,20 +117,10 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
         var runContext = conditionContext.getRunContext();
 
         return publisher(consumeTask().build(), runContext)
-            .map(received -> {
-                var execution = TriggerService.generateRealtimeExecution(this, conditionContext, context, received.message());
-                received.ack().run();
-                return execution;
-            });
+            .map(message -> TriggerService.generateRealtimeExecution(this, conditionContext, context, message));
     }
 
-    /**
-     * A received message with the callback deleting it from the queue, called once its execution exists.
-     */
-    record Received(Message message, Runnable ack) {
-    }
-
-    Flux<Received> publisher(Consume task, RunContext runContext) {
+    Flux<Message> publisher(Consume task, RunContext runContext) {
         return Flux.create(sink -> {
             started.set(true);
             var logger = runContext.logger();
@@ -138,14 +128,19 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
             try (var client = task.client(runContext)) {
                 var rQueue = task.rQueue(runContext);
                 var queue = client.queue(rQueue);
-                var rWaitSeconds = (int) Math.min(30, runContext.render(this.waitTime).as(Duration.class).orElse(Duration.ofSeconds(20)).toSeconds());
+                var rWaitTime = runContext.render(this.waitTime).as(Duration.class).orElse(Duration.ofSeconds(20));
+                if (rWaitTime.compareTo(Duration.ofSeconds(1)) < 0 || rWaitTime.compareTo(Duration.ofSeconds(30)) > 0) {
+                    throw new IllegalArgumentException("`waitTime` must be between 1 and 30 seconds, got " + rWaitTime);
+                }
+                var rWaitSeconds = (int) rWaitTime.toSeconds();
                 var rBatchSize = Math.max(1, Math.min(Consume.BATCH_SIZE, runContext.render(this.batchSize).as(Integer.class).orElse(Consume.BATCH_SIZE)));
                 var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
                 var rAutoDelete = runContext.render(this.autoDelete).as(Boolean.class).orElse(true);
 
                 logger.info("Starting MNS consumption from queue '{}'", rQueue);
                 var backoff = BACKOFF_BASE;
-                while (isActive.get()) {
+                var handedOver = new ArrayList<String>();
+                while (isActive.get() && !sink.isCancelled()) {
                     // only poll when executions are requested, so received messages never pile up in memory
                     var requested = sink.requestedFromDownstream();
                     if (requested <= 0) {
@@ -153,23 +148,23 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
                         continue;
                     }
 
+                    // Kestra took the previous messages and asks for more: they can leave the queue now.
+                    // Messages never taken (stop, kill, failure) stay and become visible again.
+                    if (rAutoDelete && !handedOver.isEmpty()) {
+                        try {
+                            Consume.delete(queue, rQueue, handedOver);
+                        } catch (RuntimeException e) {
+                            logger.warn("{}", e.getMessage());
+                        }
+                    }
+                    handedOver.clear();
+
                     try {
                         var messages = Consume.receive(queue, rQueue, (int) Math.min(rBatchSize, requested), rWaitSeconds);
                         backoff = BACKOFF_BASE;
                         for (var message : messages) {
-                            var data = Consume.deserialize(runContext, rSerdeType, message, rQueue);
-                            var handle = message.getReceiptHandle();
-                            Runnable ack = () -> {
-                                if (!rAutoDelete) {
-                                    return;
-                                }
-                                try {
-                                    Consume.delete(queue, rQueue, List.of(handle));
-                                } catch (RuntimeException e) {
-                                    logger.warn("{}", e.getMessage());
-                                }
-                            };
-                            sink.next(new Received(Message.builder().data(data).build(), ack));
+                            sink.next(Message.builder().data(Consume.deserialize(runContext, rSerdeType, message, rQueue)).build());
+                            handedOver.add(message.getReceiptHandle());
                         }
                     } catch (IllegalStateException e) {
                         if (FATAL_ERROR_CODES.contains(errorCode(e.getCause()))) {

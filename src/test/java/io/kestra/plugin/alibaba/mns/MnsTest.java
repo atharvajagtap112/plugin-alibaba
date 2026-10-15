@@ -30,6 +30,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
@@ -271,7 +272,7 @@ class MnsTest {
     }
 
     @Test
-    void realtimeTriggerEmitsOneMessageEach() {
+    void realtimeTriggerDeletesHandedOverMessagesOnNextRequest() throws Exception {
         stubReceive(messagesXml("{\"orderId\":1}", "{\"orderId\":2}"));
         wireMock.stubFor(delete(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(204)));
 
@@ -287,23 +288,46 @@ class MnsTest {
             .waitTime(Property.ofValue(Duration.ofSeconds(1)))
             .build();
 
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var executions = new CopyOnWriteArrayList<io.kestra.core.models.executions.Execution>();
+        var subscription = Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(executions::add);
         try {
-            var context = TestsUtils.mockTrigger(runContextFactory, trigger);
-            var executions = Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
-                .subscribeOn(Schedulers.boundedElastic())
-                .take(2)
-                .collectList()
-                .block(Duration.ofSeconds(30));
-
-            assertThat(executions, hasSize(2));
-            assertThat(((Map<?, ?>) executions.get(1).getTrigger().getVariables().get("data")).get("orderId"), is(2));
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
+            var deadline = System.currentTimeMillis() + 15_000;
+            while (wireMock.findAll(deleteRequestedFor(urlPathEqualTo(PATH))).isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(100);
+            }
         } finally {
             trigger.kill();
+            subscription.dispose();
         }
-        wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH)).withRequestBody(containing("handle-0")));
-        wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH)).withRequestBody(containing("handle-1")));
+
+        assertThat(executions, hasSize(2));
+        assertThat(((Map<?, ?>) executions.get(1).getTrigger().getVariables().get("data")).get("orderId"), is(2));
+        wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH))
+            .withRequestBody(containing("handle-0"))
+            .withRequestBody(containing("handle-1")));
+    }
+
+    @Test
+    void realtimeTriggerRejectsZeroWaitTime() {
+        var trigger = RealtimeTrigger.builder()
+            .id(IdUtils.create())
+            .type(RealtimeTrigger.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue(endpoint()))
+            .queue(Property.ofValue("orders"))
+            .waitTime(Property.ofValue(Duration.ZERO))
+            .build();
+
+        var flux = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            .subscribeOn(Schedulers.boundedElastic());
+
+        var e = assertThrows(IllegalArgumentException.class, () -> flux.blockLast(Duration.ofSeconds(10)));
+        assertThat(e.getMessage(), containsString("`waitTime` must be between 1 and 30 seconds"));
     }
 
     @Test
