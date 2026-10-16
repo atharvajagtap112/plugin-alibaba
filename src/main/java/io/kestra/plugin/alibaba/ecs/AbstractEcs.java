@@ -42,7 +42,10 @@ public abstract class AbstractEcs extends AbstractConnection {
     }
 
     protected RuntimeOptions runtimeOptions(RunContext runContext) throws IllegalVariableEvaluationException {
-        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class).orElse(DEFAULT_READ_TIMEOUT);
+        // 90% of the task `timeout`, so the SDK fails first with the actionable message instead of Kestra's generic timeout
+        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class)
+            .map(timeout -> timeout.multipliedBy(9).dividedBy(10))
+            .orElse(DEFAULT_READ_TIMEOUT);
         return new RuntimeOptions()
             .setConnectTimeout((int) CONNECT_TIMEOUT.toMillis())
             .setReadTimeout((int) Math.min(rReadTimeout.toMillis(), Integer.MAX_VALUE));
