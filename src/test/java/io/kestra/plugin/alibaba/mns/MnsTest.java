@@ -429,6 +429,31 @@ class MnsTest {
     }
 
     @Test
+    void realtimeTriggerDoesNotEmitMessagesReceivedAfterKill() throws Exception {
+        wireMock.stubFor(get(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withHeader("Content-Type", "text/xml")
+            .withBody(messagesXml("late")).withFixedDelay(2000)));
+
+        var trigger = realtimeTrigger();
+        var received = new CopyOnWriteArrayList<Object>();
+        var subscription = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(received::add);
+        try {
+            var deadline = System.currentTimeMillis() + 10_000;
+            while (wireMock.findAll(getRequestedFor(urlPathEqualTo(PATH))).isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            trigger.kill();
+            Thread.sleep(3000);
+        } finally {
+            subscription.dispose();
+        }
+
+        assertThat(received, hasSize(0));
+        wireMock.verify(0, deleteRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
     void realtimeTriggerRejectsOutOfRangeBatchSize() {
         var trigger = RealtimeTrigger.builder()
             .id(IdUtils.create())

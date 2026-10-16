@@ -176,8 +176,7 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
         );
     }
 
-    // Kestra took the previous messages and asks for more: they can leave the queue now.
-    // Messages never taken (stop, kill, failure) stay and become visible again.
+    // messages never taken (stop, kill, failure) stay in the queue and are redelivered
     private static void ack(RunContext runContext, CloudQueue queue, Settings settings, List<String> handedOver) {
         if (settings.rAutoDelete() && !handedOver.isEmpty()) {
             try {
@@ -189,9 +188,13 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
         handedOver.clear();
     }
 
-    private static List<String> pollOnce(RunContext runContext, CloudQueue queue, Settings settings, int count, FluxSink<ReceivedMessage> sink) {
+    private List<String> pollOnce(RunContext runContext, CloudQueue queue, Settings settings, int count, FluxSink<ReceivedMessage> sink) {
         var handles = new ArrayList<String>();
         for (var message : Consume.receive(queue, settings.rQueue(), count, settings.rWaitSeconds())) {
+            // stopped during the long-poll: no execution, the message is redelivered
+            if (!isActive.get() || sink.isCancelled()) {
+                break;
+            }
             sink.next(ReceivedMessage.builder()
                 .messageId(message.getMessageId())
                 .data(Consume.deserialize(runContext, settings.rSerdeType(), message, settings.rQueue()))
