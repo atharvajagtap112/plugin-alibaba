@@ -3,7 +3,7 @@ package io.kestra.plugin.alibaba.mns;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
+import ch.qos.logback.core.AppenderBase;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import io.kestra.core.junit.annotations.KestraTest;
@@ -38,6 +38,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.delete;
 import static com.github.tomakehurst.wiremock.client.WireMock.deleteRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
@@ -157,6 +158,37 @@ class MnsTest {
 
         assertThat(e.getMessage(), containsString("`data`"));
         wireMock.verify(0, postRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void publishRejectsOutOfRangeDelayAndPriority() {
+        var delay = assertThrows(IllegalArgumentException.class, () -> publish(Property.ofValue("cn-hangzhou"), List.of(Map.of("data", "hello", "delaySeconds", 604801))).run(runContextFactory.of(Map.of())));
+        assertThat(delay.getMessage(), is("`delaySeconds` must be between 0 and 604800, got 604801"));
+
+        var priority = assertThrows(IllegalArgumentException.class, () -> publish(Property.ofValue("cn-hangzhou"), List.of(Map.of("data", "hello", "priority", 0))).run(runContextFactory.of(Map.of())));
+        assertThat(priority.getMessage(), is("`priority` must be between 1 and 16, got 0"));
+        wireMock.verify(0, postRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void publishReportsMessagesAlreadyPublished() {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).inScenario("publish").whenScenarioStateIs(STARTED)
+            .willReturn(aResponse().withStatus(201).withHeader("Content-Type", "text/xml").withBody("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Messages xmlns="http://mns.aliyuncs.com/doc/v1">
+                  <Message><MessageId>id-0</MessageId><MessageBodyMD5>00</MessageBodyMD5></Message>
+                </Messages>
+                """))
+            .willSetStateTo("failing"));
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).inScenario("publish").whenScenarioStateIs("failing")
+            .willReturn(error(403, "AccessDenied")));
+        var messages = java.util.stream.IntStream.range(0, 17).mapToObj(i -> Map.of("data", "message-" + i)).toList();
+
+        var e = assertThrows(IllegalStateException.class, () -> publish(Property.ofValue("cn-hangzhou"), messages).run(runContextFactory.of(Map.of())));
+
+        assertThat(e.getMessage(), containsString("AccessDenied"));
+        assertThat(e.getMessage(), containsString("16 message(s) were already published, and a retry publishes them again"));
+        assertThat(e.getMessage(), containsString("mns:BatchSendMessage permission"));
     }
 
     @Test
@@ -321,6 +353,7 @@ class MnsTest {
         }
 
         assertThat(executions, hasSize(2));
+        assertThat(executions.get(0).getTrigger().getVariables().get("messageId"), is("id-0"));
         assertThat(((Map<?, ?>) executions.get(1).getTrigger().getVariables().get("data")).get("orderId"), is(2));
         wireMock.verify(deleteRequestedFor(urlPathEqualTo(PATH))
             .withRequestBody(containing("handle-0"))
@@ -371,7 +404,48 @@ class MnsTest {
     void realtimeTriggerKillBeforeStartDoesNotBlock() {
         var trigger = realtimeTrigger();
 
-        assertTimeoutPreemptively(Duration.ofSeconds(5), trigger::kill);
+        assertTimeoutPreemptively(Duration.ofSeconds(1), trigger::kill);
+    }
+
+    @Test
+    void realtimeTriggerKillDuringAPollDoesNotBlock() throws Exception {
+        wireMock.stubFor(get(urlPathEqualTo(PATH)).willReturn(error(404, "MessageNotExist").withFixedDelay(5000)));
+
+        var trigger = realtimeTrigger();
+        var subscription = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe();
+        try {
+            var deadline = System.currentTimeMillis() + 10_000;
+            while (wireMock.findAll(getRequestedFor(urlPathEqualTo(PATH))).isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertThat(wireMock.findAll(getRequestedFor(urlPathEqualTo(PATH))).isEmpty(), is(false));
+
+            assertTimeoutPreemptively(Duration.ofSeconds(1), trigger::kill);
+        } finally {
+            subscription.dispose();
+        }
+    }
+
+    @Test
+    void realtimeTriggerRejectsOutOfRangeBatchSize() {
+        var trigger = RealtimeTrigger.builder()
+            .id(IdUtils.create())
+            .type(RealtimeTrigger.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue(endpoint()))
+            .queue(Property.ofValue("orders"))
+            .batchSize(Property.ofValue(50))
+            .build();
+
+        var flux = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            .subscribeOn(Schedulers.boundedElastic());
+
+        var e = assertThrows(IllegalArgumentException.class, () -> flux.blockLast(Duration.ofSeconds(10)));
+        assertThat(e.getMessage(), is("`batchSize` must be between 1 and 16, got 50"));
     }
 
     private RealtimeTrigger realtimeTrigger() {
@@ -413,7 +487,13 @@ class MnsTest {
         stubPublishOk();
         var sdkLogger = (Logger) LoggerFactory.getLogger("com.aliyun.mns");
         var previousLevel = sdkLogger.getLevel();
-        var appender = new ListAppender<ILoggingEvent>();
+        var events = new CopyOnWriteArrayList<ILoggingEvent>();
+        var appender = new AppenderBase<ILoggingEvent>() {
+            @Override
+            protected void append(ILoggingEvent event) {
+                events.add(event);
+            }
+        };
         appender.start();
         sdkLogger.addAppender(appender);
         sdkLogger.setLevel(Level.DEBUG);
@@ -436,8 +516,8 @@ class MnsTest {
             sdkLogger.setLevel(previousLevel);
         }
 
-        assertThat(appender.list.isEmpty(), is(false));
-        for (var event : appender.list) {
+        assertThat(events.isEmpty(), is(false));
+        for (var event : events) {
             assertThat(event.getFormattedMessage(), not(containsString("very-secret-value")));
             assertThat(event.getFormattedMessage(), not(containsString("very-secret-token")));
         }

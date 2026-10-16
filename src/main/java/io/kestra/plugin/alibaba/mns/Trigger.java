@@ -69,10 +69,12 @@ public class Trigger extends AbstractMnsTrigger implements PollingTriggerInterfa
 
     @Schema(
         title = "Max records",
-        description = "Stop a poll after consuming this many messages, at least 1."
+        description = "Stop a poll after consuming this many messages, at least 1, 1000 by default."
     )
+    @NotNull
     @PluginProperty(group = "execution")
-    private Property<Integer> maxRecords;
+    @Builder.Default
+    private Property<Integer> maxRecords = Property.ofValue(Consume.DEFAULT_MAX_RECORDS);
 
     @Schema(
         title = "Max duration",

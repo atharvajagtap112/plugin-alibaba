@@ -36,12 +36,11 @@ public abstract class AbstractMnsTrigger extends AbstractTrigger implements Alib
     @ToString.Exclude
     protected Property<String> securityToken;
 
-    @Schema(title = "Region", description = "The Alibaba Cloud region ID, for example `cn-hangzhou`.")
-    @NotNull
+    @Schema(title = "Region", description = "The Alibaba Cloud region ID, for example `cn-hangzhou`. The service endpoint is derived from it unless `endpointOverride` is set.")
     @PluginProperty(group = "connection")
     protected Property<String> region;
 
-    @Schema(title = "Endpoint override", description = "Custom http or https endpoint URL. When set, it takes precedence over the endpoint derived from `accountId` and `region`.")
+    @Schema(title = "Endpoint override", description = "Custom http or https endpoint URL. When set, it takes precedence over the endpoint derived from `region`.")
     @PluginProperty(group = "connection")
     protected Property<String> endpointOverride;
 
@@ -57,7 +56,10 @@ public abstract class AbstractMnsTrigger extends AbstractTrigger implements Alib
     @PluginProperty(group = "main")
     protected Property<String> queue;
 
-    @Schema(title = "Serde type", description = "`STRING` keeps message bodies as text, `JSON` parses them.")
+    @Schema(
+        title = "Serde type",
+        description = "`STRING` keeps message bodies as text, `JSON` parses them. A body that is not valid JSON is kept as a string and logged."
+    )
     @NotNull
     @PluginProperty(group = "processing")
     @Builder.Default
@@ -65,7 +67,7 @@ public abstract class AbstractMnsTrigger extends AbstractTrigger implements Alib
 
     @Schema(
         title = "Auto-delete",
-        description = "Delete messages from the queue once they are received. When false, they become visible again after the queue's visibility timeout."
+        description = "Delete messages from the queue once they are handed to Kestra: `Trigger` deletes them once the ION file is stored, `RealtimeTrigger` once Kestra has taken them and requests more messages. When false, they become visible again after the queue's visibility timeout."
     )
     @PluginProperty(group = "processing")
     @Builder.Default

@@ -202,12 +202,15 @@ Message bodies are sent and read as raw strings, which is what the MNS console a
 
 `Consume` stores the received messages first and only then deletes them, so the stored file always holds every deleted message. Keep `maxDuration` below the queue's visibility timeout (30 seconds by default): a message whose receipt handle expired before the deletion is delivered again, and the failed deletion is logged as a warning. `Trigger` deletes the messages once the file is stored, before the scheduler saves the execution, so a failure in between loses them; set `autoDelete: false` to keep them in the queue until their visibility timeout ends. `RealtimeTrigger` deletes the messages of a poll once Kestra has taken them and requests more, so a stop or kill never deletes a message that was not handed over, although a crash right after the hand-over can still lose it.
 
+MNS requests use a 10 second connect timeout and a 45 second socket timeout, above the 30 second maximum long-poll wait, with up to 3 retries.
+
 ### `io.kestra.plugin.alibaba.mns.Publish`
 
 Sends messages to a queue in batches of 16.
 
-- Required: `queue`, `from` (a message, a list of messages, or a `kestra://` ION file with one message per row). Each message has a `data` field (a string, or a map or list sent as JSON) and optional `delaySeconds` and `priority`.
+- Required: `queue`, `from` (a message, a list of messages, or a `kestra://` ION file with one message per row). Each message has a `data` field (a string, or a map or list sent as JSON) and optional `delaySeconds` (0 to 604800) and `priority` (1 to 16).
 - Inline messages are rendered once by Kestra. Rows read from a `kestra://` file are sent as is, so file content is never evaluated as a template.
+- If a batch fails, the error says how many messages were already published: a retry publishes them again.
 - Outputs: `messagesCount`.
 
 ### `io.kestra.plugin.alibaba.mns.Consume`
@@ -215,7 +218,7 @@ Sends messages to a queue in batches of 16.
 Receives messages until the queue is empty, `maxRecords` is reached or `maxDuration` elapses, and stores them in an ION file.
 
 - Required: `queue`.
-- Optional: `maxDuration` (20 seconds by default), `maxRecords` (at least 1), `serdeType` (`STRING` by default, or `JSON`; a body that is not valid JSON is kept as a string and logged), `autoDelete` (`true` by default).
+- Optional: `maxDuration` (20 seconds by default), `maxRecords` (1000 by default, at least 1), `serdeType` (`STRING` by default, or `JSON`; a body that is not valid JSON is kept as a string and logged), `autoDelete` (`true` by default).
 - Outputs: `count`, and `uri` when at least one message was received.
 
 ### `io.kestra.plugin.alibaba.mns.Trigger`
@@ -230,5 +233,5 @@ Polls a queue every `interval` (60 seconds by default) and starts one execution 
 Long-polls a queue and starts one execution per message. It only polls when executions are requested, so messages are never buffered without bound.
 
 - Required: `queue`.
-- Optional: `serdeType`, `autoDelete`, `waitTime` (20 seconds by default, from 1 to 30), `batchSize` (16 by default).
-- Outputs: `trigger.data`.
+- Optional: `serdeType`, `autoDelete`, `waitTime` (20 seconds by default, from 1 to 30), `batchSize` (16 by default, from 1 to 16).
+- Outputs: `trigger.data`, `trigger.messageId`.

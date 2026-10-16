@@ -21,6 +21,8 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
 import java.net.URI;
+import java.time.Duration;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 @SuperBuilder
@@ -31,6 +33,10 @@ import java.util.regex.Pattern;
 public abstract class AbstractMns extends AbstractConnection {
     private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("^[0-9]+$");
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    // above the 30 second maximum long-poll wait of a receive request
+    private static final Duration SOCKET_TIMEOUT = Duration.ofSeconds(45);
+    private static final int MAX_ERROR_RETRY = 3;
 
     @Schema(
         title = "Account ID",
@@ -52,35 +58,56 @@ public abstract class AbstractMns extends AbstractConnection {
     }
 
     protected Client client(RunContext runContext) throws IllegalVariableEvaluationException {
-        var regionId = renderedRegion(runContext);
-        if (!REGION_PATTERN.matcher(regionId).matches()) {
-            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + regionId);
+        var rRegion = renderedRegion(runContext);
+        if (!REGION_PATTERN.matcher(rRegion).matches()) {
+            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + rRegion);
         }
 
-        var override = renderedEndpoint(runContext);
+        var rEndpointOverride = renderedEndpoint(runContext);
         String endpoint;
-        if (override == null) {
-            var account = required(runContext, this.accountId, "accountId");
-            if (!ACCOUNT_PATTERN.matcher(account).matches()) {
-                throw new IllegalArgumentException("`accountId` must only contain digits, got: " + account);
+        if (rEndpointOverride == null) {
+            var rAccountId = required(runContext, this.accountId, "accountId");
+            if (!ACCOUNT_PATTERN.matcher(rAccountId).matches()) {
+                throw new IllegalArgumentException("`accountId` must only contain digits, got: " + rAccountId);
             }
-            endpoint = "https://" + account + ".mns." + regionId + ".aliyuncs.com";
+            endpoint = "https://" + rAccountId + ".mns." + rRegion + ".aliyuncs.com";
         } else {
-            var uri = endpointUri(override);
+            var uri = endpointUri(rEndpointOverride);
             if (uri.getScheme().equals("http")) {
                 runContext.logger().warn("`endpointOverride` uses plain http, credentials and signed requests are sent unencrypted to {}", uri.getAuthority());
             }
-            endpoint = override;
+            endpoint = rEndpointOverride;
         }
 
-        var id = renderedAccessKeyId(runContext);
-        var secret = renderedAccessKeySecret(runContext);
-        var token = renderedSecurityToken(runContext);
-        var credentials = token == null ? new BasicCredentials(id, secret) : new BasicSessionCredentials(id, secret, token);
+        var rAccessKeyId = renderedAccessKeyId(runContext);
+        var rAccessKeySecret = renderedAccessKeySecret(runContext);
+        var rSecurityToken = renderedSecurityToken(runContext);
+        var credentials = rSecurityToken == null
+            ? new BasicCredentials(rAccessKeyId, rAccessKeySecret)
+            : new BasicSessionCredentials(rAccessKeyId, rAccessKeySecret, rSecurityToken);
+
+        var configuration = new ClientConfiguration();
+        configuration.setConnectionTimeout((int) CONNECT_TIMEOUT.toMillis());
+        configuration.setSocketTimeout((int) SOCKET_TIMEOUT.toMillis());
+        configuration.setMaxErrorRetry(MAX_ERROR_RETRY);
 
         // credentials go through a provider: the SDK logs the AccessKey arguments of CloudAccount in clear text at DEBUG level
-        var account = new CloudAccount(null, null, endpoint, null, new StaticCredentialsProvider(credentials), new ClientConfiguration(), regionId);
+        var account = new CloudAccount(null, null, endpoint, null, new StaticCredentialsProvider(credentials), configuration, rRegion);
         return new Client(account.getMNSClient());
+    }
+
+    static String hint(String errorCode, String permission) {
+        if (errorCode == null) {
+            return "check `region`, `accountId` or `endpointOverride` and network access to MNS";
+        }
+        return switch (errorCode) {
+            case "QueueNotExist" -> "check that the queue exists in this region and account";
+            case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch" -> "check the credentials and that they have the " + permission + " permission";
+            case "InternalError", "ServiceUnavailable" -> "MNS returned a service error, retry later";
+            default -> errorCode.toLowerCase(Locale.ROOT).contains("limit") || errorCode.toLowerCase(Locale.ROOT).contains("throttl")
+                ? "requests are throttled, retry later"
+                : "look up the error code in the MNS API reference";
+        };
     }
 
     private static URI endpointUri(String endpoint) {

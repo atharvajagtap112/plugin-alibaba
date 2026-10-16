@@ -13,6 +13,11 @@ import lombok.extern.jackson.Jacksonized;
 @Builder
 @Jacksonized
 public class Message implements io.kestra.core.models.tasks.Output {
+    private static final int MIN_DELAY_SECONDS = 0;
+    private static final int MAX_DELAY_SECONDS = 604800;
+    private static final int MIN_PRIORITY = 1;
+    private static final int MAX_PRIORITY = 16;
+
     @Schema(
         title = "The message data",
         description = "A string or a structured value (map, list) serialized to JSON before sending. Inline messages are rendered once by Kestra, rows read from a `kestra://` file are sent as is."
@@ -36,6 +41,13 @@ public class Message implements io.kestra.core.models.tasks.Output {
     private Integer priority;
 
     public com.aliyun.mns.model.Message toMns() throws JsonProcessingException {
+        if (delaySeconds != null && (delaySeconds < MIN_DELAY_SECONDS || delaySeconds > MAX_DELAY_SECONDS)) {
+            throw new IllegalArgumentException("`delaySeconds` must be between " + MIN_DELAY_SECONDS + " and " + MAX_DELAY_SECONDS + ", got " + delaySeconds);
+        }
+        if (priority != null && (priority < MIN_PRIORITY || priority > MAX_PRIORITY)) {
+            throw new IllegalArgumentException("`priority` must be between " + MIN_PRIORITY + " and " + MAX_PRIORITY + ", got " + priority);
+        }
+
         var message = new com.aliyun.mns.model.Message();
         message.setMessageBodyAsRawString(body());
         if (delaySeconds != null) {

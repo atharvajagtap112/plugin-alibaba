@@ -1,5 +1,6 @@
 package io.kestra.plugin.alibaba.mns;
 
+import com.aliyun.mns.client.CloudQueue;
 import com.aliyun.mns.common.BatchSendException;
 import com.aliyun.mns.common.ClientException;
 import com.aliyun.mns.common.ServiceException;
@@ -117,33 +118,7 @@ public class Publish extends AbstractMns implements RunnableTask<Publish.Output>
             Data.from(from)
                 .readAs(runContext, Message.class, map -> JacksonMapper.toMap(map, Message.class))
                 .buffer(BATCH_SIZE)
-                .doOnNext(throwConsumer(batch -> {
-                    var messages = new ArrayList<com.aliyun.mns.model.Message>(batch.size());
-                    for (var message : batch) {
-                        messages.add(message.toMns());
-                    }
-                    try {
-                        queue.batchPutMessage(messages);
-                    } catch (BatchSendException e) {
-                        var failed = e.getMessages().stream()
-                            .filter(com.aliyun.mns.model.Message::isErrorMessage)
-                            .map(m -> m.getErrorMessageDetail().getErrorCode() + ": " + m.getErrorMessageDetail().getErrorMessage())
-                            .toList();
-                        throw new IllegalStateException(
-                            "Unable to publish " + failed.size() + " of " + batch.size() + " messages to MNS queue '" + rQueue + "': " + failed, e
-                        );
-                    } catch (ServiceException e) {
-                        throw new IllegalStateException(
-                            "Unable to publish to MNS queue '" + rQueue + "' (" + e.getErrorCode() + "): " +
-                                "check that the queue exists in this region and account, and that the credentials have the mns:BatchSendMessage permission", e
-                        );
-                    } catch (ClientException e) {
-                        throw new IllegalStateException(
-                            "Unable to reach MNS for queue '" + rQueue + "': check `region`, `accountId` or `endpointOverride` and network access", e
-                        );
-                    }
-                    total.addAndGet(batch.size());
-                }))
+                .doOnNext(throwConsumer(batch -> total.addAndGet(publishBatch(queue, rQueue, batch, total.get()))))
                 .blockLast();
 
             runContext.metric(Counter.of("mns.publish.messages", total.get(), "queue", rQueue));
@@ -153,6 +128,40 @@ public class Publish extends AbstractMns implements RunnableTask<Publish.Output>
                 .messagesCount(total.get())
                 .build();
         }
+    }
+
+    private static int publishBatch(CloudQueue queue, String rQueue, List<Message> batch, int published) throws Exception {
+        var messages = new ArrayList<com.aliyun.mns.model.Message>(batch.size());
+        for (var message : batch) {
+            messages.add(message.toMns());
+        }
+
+        try {
+            queue.batchPutMessage(messages);
+            return batch.size();
+        } catch (BatchSendException e) {
+            var failed = e.getMessages().stream()
+                .filter(com.aliyun.mns.model.Message::isErrorMessage)
+                .map(com.aliyun.mns.model.Message::getErrorMessageDetail)
+                .toList();
+            var codes = failed.stream().map(m -> m.getErrorCode() + ": " + m.getErrorMessage()).toList();
+            throw new IllegalStateException(
+                "Unable to publish " + failed.size() + " of " + batch.size() + " messages to MNS queue '" + rQueue + "' " + codes +
+                    alreadyPublished(published + batch.size() - failed.size()) + ": " + hint(failed.isEmpty() ? null : failed.getFirst().getErrorCode(), "mns:BatchSendMessage"), e
+            );
+        } catch (ServiceException e) {
+            throw new IllegalStateException(
+                "Unable to publish to MNS queue '" + rQueue + "' (" + e.getErrorCode() + ")" + alreadyPublished(published) + ": " + hint(e.getErrorCode(), "mns:BatchSendMessage"), e
+            );
+        } catch (ClientException e) {
+            throw new IllegalStateException(
+                "Unable to reach MNS for queue '" + rQueue + "'" + alreadyPublished(published) + ": " + hint(null, null), e
+            );
+        }
+    }
+
+    private static String alreadyPublished(int count) {
+        return count == 0 ? "" : ". " + count + " message(s) were already published, and a retry publishes them again";
     }
 
     @Builder

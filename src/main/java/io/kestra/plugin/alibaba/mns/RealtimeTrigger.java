@@ -1,7 +1,9 @@
 package io.kestra.plugin.alibaba.mns;
 
 import com.aliyun.mns.common.ServiceException;
+import com.aliyun.mns.client.CloudQueue;
 import com.aliyun.mns.common.ServiceHandlingRequiredException;
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -13,7 +15,7 @@ import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
 import io.kestra.core.runners.RunContext;
-import io.kestra.plugin.alibaba.mns.model.Message;
+import io.kestra.plugin.alibaba.mns.model.ReceivedMessage;
 import io.kestra.plugin.alibaba.mns.model.SerdeType;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.AccessLevel;
@@ -25,12 +27,12 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuperBuilder
@@ -71,24 +73,26 @@ import java.util.concurrent.atomic.AtomicBoolean;
         )
     }
 )
-public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTriggerInterface, TriggerOutput<Message> {
+public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTriggerInterface, TriggerOutput<ReceivedMessage> {
+    private static final Duration DEFAULT_WAIT_TIME = Duration.ofSeconds(20);
+    private static final Duration MIN_WAIT_TIME = Duration.ofSeconds(1);
+    private static final Duration MAX_WAIT_TIME = Duration.ofSeconds(30);
     private static final Duration BACKOFF_BASE = Duration.ofSeconds(1);
     private static final Duration BACKOFF_MAX = Duration.ofSeconds(30);
     private static final Duration SLEEP_SLICE = Duration.ofMillis(200);
-    private static final Duration KILL_TIMEOUT = Duration.ofMinutes(1);
     private static final Set<String> FATAL_ERROR_CODES = Set.of("AccessDenied", "QueueNotExist", "InvalidAccessKeyId", "SignatureDoesNotMatch");
 
     @Schema(
         title = "Wait time",
-        description = "How long each long-poll request waits for messages, from 1 to 30 seconds."
+        description = "How long each long-poll request waits for messages, from 1 to 30 seconds, 20 seconds by default."
     )
     @PluginProperty(group = "advanced")
     @Builder.Default
-    private Property<Duration> waitTime = Property.ofValue(Duration.ofSeconds(20));
+    private Property<Duration> waitTime = Property.ofValue(DEFAULT_WAIT_TIME);
 
     @Schema(
         title = "Batch size",
-        description = "Maximum number of messages fetched per request, from 1 to 16. Each message still starts its own execution."
+        description = "Maximum number of messages fetched per request, from 1 to 16, 16 by default. Each message still starts its own execution."
     )
     @PluginProperty(group = "advanced")
     @Builder.Default
@@ -100,18 +104,6 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
     @EqualsAndHashCode.Exclude
     private final AtomicBoolean isActive = new AtomicBoolean(true);
 
-    @Builder.Default
-    @Getter(AccessLevel.NONE)
-    @ToString.Exclude
-    @EqualsAndHashCode.Exclude
-    private final AtomicBoolean started = new AtomicBoolean(false);
-
-    @Builder.Default
-    @Getter(AccessLevel.NONE)
-    @ToString.Exclude
-    @EqualsAndHashCode.Exclude
-    private final CountDownLatch waitForTermination = new CountDownLatch(1);
-
     @Override
     public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) throws Exception {
         var runContext = conditionContext.getRunContext();
@@ -120,24 +112,14 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
             .map(message -> TriggerService.generateRealtimeExecution(this, conditionContext, context, message));
     }
 
-    Flux<Message> publisher(Consume task, RunContext runContext) {
+    Flux<ReceivedMessage> publisher(Consume task, RunContext runContext) {
         return Flux.create(sink -> {
-            started.set(true);
-            var logger = runContext.logger();
             var signalledError = false;
             try (var client = task.client(runContext)) {
-                var rQueue = task.rQueue(runContext);
-                var queue = client.queue(rQueue);
-                var rWaitTime = runContext.render(this.waitTime).as(Duration.class).orElse(Duration.ofSeconds(20));
-                if (rWaitTime.compareTo(Duration.ofSeconds(1)) < 0 || rWaitTime.compareTo(Duration.ofSeconds(30)) > 0) {
-                    throw new IllegalArgumentException("`waitTime` must be between 1 and 30 seconds, got " + rWaitTime);
-                }
-                var rWaitSeconds = (int) rWaitTime.toSeconds();
-                var rBatchSize = Math.max(1, Math.min(Consume.BATCH_SIZE, runContext.render(this.batchSize).as(Integer.class).orElse(Consume.BATCH_SIZE)));
-                var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
-                var rAutoDelete = runContext.render(this.autoDelete).as(Boolean.class).orElse(true);
+                var settings = settings(task, runContext);
+                var queue = client.queue(settings.rQueue());
+                runContext.logger().info("Starting MNS consumption from queue '{}'", settings.rQueue());
 
-                logger.info("Starting MNS consumption from queue '{}'", rQueue);
                 var backoff = BACKOFF_BASE;
                 var handedOver = new ArrayList<String>();
                 while (isActive.get() && !sink.isCancelled()) {
@@ -148,34 +130,20 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
                         continue;
                     }
 
-                    // Kestra took the previous messages and asks for more: they can leave the queue now.
-                    // Messages never taken (stop, kill, failure) stay and become visible again.
-                    if (rAutoDelete && !handedOver.isEmpty()) {
-                        try {
-                            Consume.delete(queue, rQueue, handedOver);
-                        } catch (RuntimeException e) {
-                            logger.warn("{}", e.getMessage());
-                        }
-                    }
-                    handedOver.clear();
-
+                    ack(runContext, queue, settings, handedOver);
                     try {
-                        var messages = Consume.receive(queue, rQueue, (int) Math.min(rBatchSize, requested), rWaitSeconds);
+                        handedOver.addAll(pollOnce(runContext, queue, settings, (int) Math.min(settings.rBatchSize(), requested), sink));
                         backoff = BACKOFF_BASE;
-                        for (var message : messages) {
-                            sink.next(Message.builder().data(Consume.deserialize(runContext, rSerdeType, message, rQueue)).build());
-                            handedOver.add(message.getReceiptHandle());
-                        }
                     } catch (IllegalStateException e) {
                         if (FATAL_ERROR_CODES.contains(errorCode(e.getCause()))) {
-                            logger.error("Stopping the trigger: {}", e.getMessage());
+                            runContext.logger().error("Stopping the trigger: {}", e.getMessage());
                             signalledError = true;
                             isActive.set(false);
                             sink.error(e);
                         } else {
-                            logger.warn("{}. Retrying in {}", e.getMessage(), backoff);
+                            runContext.logger().warn("{}. Retrying in {}", e.getMessage(), backoff);
                             sleep(backoff);
-                            backoff = backoff.multipliedBy(2).compareTo(BACKOFF_MAX) > 0 ? BACKOFF_MAX : backoff.multipliedBy(2);
+                            backoff = nextBackoff(backoff);
                         }
                     }
                 }
@@ -186,9 +154,56 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
                 if (!signalledError) {
                     sink.complete();
                 }
-                this.waitForTermination.countDown();
             }
         });
+    }
+
+    private Settings settings(Consume task, RunContext runContext) throws IllegalVariableEvaluationException {
+        var rWaitTime = runContext.render(this.waitTime).as(Duration.class).orElse(DEFAULT_WAIT_TIME);
+        if (rWaitTime.compareTo(MIN_WAIT_TIME) < 0 || rWaitTime.compareTo(MAX_WAIT_TIME) > 0) {
+            throw new IllegalArgumentException("`waitTime` must be between 1 and 30 seconds, got " + rWaitTime);
+        }
+        var rBatchSize = runContext.render(this.batchSize).as(Integer.class).orElse(Consume.BATCH_SIZE);
+        if (rBatchSize < 1 || rBatchSize > Consume.BATCH_SIZE) {
+            throw new IllegalArgumentException("`batchSize` must be between 1 and " + Consume.BATCH_SIZE + ", got " + rBatchSize);
+        }
+        return new Settings(
+            task.rQueue(runContext),
+            (int) rWaitTime.toSeconds(),
+            rBatchSize,
+            runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING),
+            runContext.render(this.autoDelete).as(Boolean.class).orElse(true)
+        );
+    }
+
+    // Kestra took the previous messages and asks for more: they can leave the queue now.
+    // Messages never taken (stop, kill, failure) stay and become visible again.
+    private static void ack(RunContext runContext, CloudQueue queue, Settings settings, List<String> handedOver) {
+        if (settings.rAutoDelete() && !handedOver.isEmpty()) {
+            try {
+                Consume.delete(queue, settings.rQueue(), handedOver);
+            } catch (RuntimeException e) {
+                runContext.logger().warn("{}", e.getMessage());
+            }
+        }
+        handedOver.clear();
+    }
+
+    private static List<String> pollOnce(RunContext runContext, CloudQueue queue, Settings settings, int count, FluxSink<ReceivedMessage> sink) {
+        var handles = new ArrayList<String>();
+        for (var message : Consume.receive(queue, settings.rQueue(), count, settings.rWaitSeconds())) {
+            sink.next(ReceivedMessage.builder()
+                .messageId(message.getMessageId())
+                .data(Consume.deserialize(runContext, settings.rSerdeType(), message, settings.rQueue()))
+                .build());
+            handles.add(message.getReceiptHandle());
+        }
+        return handles;
+    }
+
+    private static Duration nextBackoff(Duration backoff) {
+        var doubled = backoff.multipliedBy(2);
+        return doubled.compareTo(BACKOFF_MAX) > 0 ? BACKOFF_MAX : doubled;
     }
 
     private static String errorCode(Throwable cause) {
@@ -201,28 +216,15 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
         return null;
     }
 
+    // never waits: the loop ends after the in-flight long-poll returns and then closes the client
     @Override
     public void kill() {
-        stop(true);
+        isActive.set(false);
     }
 
     @Override
     public void stop() {
-        stop(false);
-    }
-
-    private void stop(boolean wait) {
-        if (!isActive.compareAndSet(true, false)) {
-            return;
-        }
-        // never subscribed: there is no polling loop to wait for
-        if (wait && started.get()) {
-            try {
-                this.waitForTermination.await(KILL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        isActive.set(false);
     }
 
     private void sleep(Duration delay) {
@@ -238,5 +240,8 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
             }
             remaining -= slice;
         }
+    }
+
+    private record Settings(String rQueue, int rWaitSeconds, int rBatchSize, SerdeType rSerdeType, boolean rAutoDelete) {
     }
 }

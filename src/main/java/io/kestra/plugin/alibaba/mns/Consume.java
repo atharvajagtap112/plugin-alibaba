@@ -25,6 +25,7 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
 import java.io.BufferedOutputStream;
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.URI;
@@ -78,17 +79,20 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
     static final int BATCH_SIZE = 16;
     static final String MESSAGE_NOT_EXIST = "MessageNotExist";
     static final Duration DEFAULT_MAX_DURATION = Duration.ofSeconds(20);
+    static final int DEFAULT_MAX_RECORDS = 1000;
 
     @Schema(
         title = "Max records",
-        description = "Stop after consuming this many messages, at least 1."
+        description = "Stop after consuming this many messages, at least 1, 1000 by default."
     )
+    @NotNull
     @PluginProperty(group = "execution")
-    private Property<Integer> maxRecords;
+    @Builder.Default
+    private Property<Integer> maxRecords = Property.ofValue(DEFAULT_MAX_RECORDS);
 
     @Schema(
         title = "Max duration",
-        description = "Stop after this duration elapses. Keep it below the queue's visibility timeout (30 seconds by default): messages are deleted at the end of the run, and a message whose receipt handle expired in the meantime is delivered again."
+        description = "Stop after this duration elapses, 20 seconds by default. Keep it below the queue's visibility timeout (30 seconds by default): messages are deleted at the end of the run, and a message whose receipt handle expired in the meantime is delivered again."
     )
     @NotNull
     @PluginProperty(group = "execution")
@@ -115,47 +119,27 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
     @Override
     public Output run(RunContext runContext) throws Exception {
         var rQueue = rQueue(runContext);
-        var rMaxRecords = runContext.render(this.maxRecords).as(Integer.class).orElse(Integer.MAX_VALUE);
-        var rMaxDuration = runContext.render(this.maxDuration).as(Duration.class).orElse(DEFAULT_MAX_DURATION);
+        var rMaxRecords = runContext.render(this.maxRecords).as(Integer.class).orElse(DEFAULT_MAX_RECORDS);
         if (rMaxRecords < 1) {
             throw new IllegalArgumentException("`maxRecords` must be at least 1, got " + rMaxRecords);
         }
+        var rMaxDuration = runContext.render(this.maxDuration).as(Duration.class).orElse(DEFAULT_MAX_DURATION);
         if (rMaxDuration.isNegative() || rMaxDuration.isZero()) {
             throw new IllegalArgumentException("`maxDuration` must be positive, got " + rMaxDuration);
         }
         var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
         var rAutoDelete = runContext.render(this.autoDelete).as(Boolean.class).orElse(true);
-        var deadline = Instant.now().plus(rMaxDuration);
 
-        var handles = new ArrayList<String>();
-        var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         try (var client = client(runContext)) {
             var queue = client.queue(rQueue);
-            try (var output = new BufferedOutputStream(new FileOutputStream(tempFile))) {
-                while (handles.size() < rMaxRecords && Instant.now().isBefore(deadline)) {
-                    var messages = receive(queue, rQueue, Math.min(BATCH_SIZE, rMaxRecords - handles.size()), 1);
-                    if (messages.isEmpty()) {
-                        break;
-                    }
-                    for (var message : messages) {
-                        FileSerde.write(output, deserialize(runContext, rSerdeType, message, rQueue));
-                        handles.add(message.getReceiptHandle());
-                    }
-                }
-            }
+            var file = runContext.workingDir().createTempFile(".ion").toFile();
+            var handles = receiveInto(runContext, file, queue, rQueue, rSerdeType, rMaxRecords, Instant.now().plus(rMaxDuration));
 
             URI uri = null;
             if (!handles.isEmpty()) {
-                uri = runContext.storage().putFile(tempFile);
+                uri = runContext.storage().putFile(file);
                 if (rAutoDelete) {
-                    // messages are only removed from the queue once they are safely stored
-                    for (var i = 0; i < handles.size(); i += BATCH_SIZE) {
-                        try {
-                            delete(queue, rQueue, handles.subList(i, Math.min(i + BATCH_SIZE, handles.size())));
-                        } catch (IllegalStateException e) {
-                            runContext.logger().warn(e.getMessage());
-                        }
-                    }
+                    deleteAll(runContext, queue, rQueue, handles);
                 }
             }
 
@@ -166,6 +150,34 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
                 .count(handles.size())
                 .uri(uri)
                 .build();
+        }
+    }
+
+    private static List<String> receiveInto(RunContext runContext, File file, CloudQueue queue, String rQueue, SerdeType rSerdeType, int rMaxRecords, Instant deadline) throws IOException {
+        var handles = new ArrayList<String>();
+        try (var output = new BufferedOutputStream(new FileOutputStream(file))) {
+            while (handles.size() < rMaxRecords && Instant.now().isBefore(deadline)) {
+                var messages = receive(queue, rQueue, Math.min(BATCH_SIZE, rMaxRecords - handles.size()), 1);
+                if (messages.isEmpty()) {
+                    break;
+                }
+                for (var message : messages) {
+                    FileSerde.write(output, deserialize(runContext, rSerdeType, message, rQueue));
+                    handles.add(message.getReceiptHandle());
+                }
+            }
+        }
+        return handles;
+    }
+
+    // called once the file is stored, so a message only leaves the queue when it is safe in internal storage
+    private static void deleteAll(RunContext runContext, CloudQueue queue, String rQueue, List<String> handles) {
+        for (var i = 0; i < handles.size(); i += BATCH_SIZE) {
+            try {
+                delete(queue, rQueue, handles.subList(i, Math.min(i + BATCH_SIZE, handles.size())));
+            } catch (IllegalStateException e) {
+                runContext.logger().warn(e.getMessage());
+            }
         }
     }
 
@@ -188,17 +200,14 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
                 return List.of();
             }
             throw new IllegalStateException(
-                "Unable to receive from MNS queue '" + name + "' (" + e.getErrorCode() + "): " +
-                    "check that the queue exists in this region and account, and that the credentials have the mns:BatchReceiveMessage permission", e
+                "Unable to receive from MNS queue '" + name + "' (" + e.getErrorCode() + "): " + hint(e.getErrorCode(), "mns:BatchReceiveMessage"), e
             );
         } catch (ServiceHandlingRequiredException e) {
             throw new IllegalStateException(
-                "Unable to receive from MNS queue '" + name + "' (" + e.getErrorCode() + "): check the queue configuration and the credentials", e
+                "Unable to receive from MNS queue '" + name + "' (" + e.getErrorCode() + "): " + hint(e.getErrorCode(), "mns:BatchReceiveMessage"), e
             );
         } catch (ClientException e) {
-            throw new IllegalStateException(
-                "Unable to reach MNS for queue '" + name + "': check `region`, `accountId` or `endpointOverride` and network access", e
-            );
+            throw new IllegalStateException("Unable to reach MNS for queue '" + name + "': " + hint(null, null), e);
         }
     }
 
@@ -212,12 +221,11 @@ public class Consume extends AbstractMns implements RunnableTask<Consume.Output>
             );
         } catch (ServiceException e) {
             throw new IllegalStateException(
-                "Unable to delete messages from MNS queue '" + name + "' (" + e.getErrorCode() + "), they will be delivered again: " +
-                    "check that the credentials have the mns:BatchDeleteMessage permission", e
+                "Unable to delete messages from MNS queue '" + name + "' (" + e.getErrorCode() + "), they will be delivered again: " + hint(e.getErrorCode(), "mns:BatchDeleteMessage"), e
             );
         } catch (ServiceHandlingRequiredException e) {
             throw new IllegalStateException(
-                "Unable to delete messages from MNS queue '" + name + "' (" + e.getErrorCode() + "), they will be delivered again", e
+                "Unable to delete messages from MNS queue '" + name + "' (" + e.getErrorCode() + "), they will be delivered again: " + hint(e.getErrorCode(), "mns:BatchDeleteMessage"), e
             );
         }
     }
