@@ -61,7 +61,7 @@ import java.util.List;
                     queue: orders
                     serdeType: JSON
                     maxRecords: 100
-                    maxDuration: PT1M
+                    maxDuration: PT20S
                 """
         )
     },

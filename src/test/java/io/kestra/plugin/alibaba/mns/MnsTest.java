@@ -143,6 +143,23 @@ class MnsTest {
     }
 
     @Test
+    void publishRejectsRowWithoutData() throws Exception {
+        stubPublishOk();
+
+        var runContext = runContextFactory.of(Map.of());
+        var file = runContext.workingDir().createTempFile(".ion").toFile();
+        try (var output = new FileOutputStream(file)) {
+            FileSerde.write(output, Map.of("priority", 1));
+        }
+        var uri = runContext.storage().putFile(file);
+
+        var e = assertThrows(IllegalArgumentException.class, () -> publish(Property.ofValue("cn-hangzhou"), uri.toString()).run(runContext));
+
+        assertThat(e.getMessage(), containsString("`data`"));
+        wireMock.verify(0, postRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
     void publishRendersInlineDataOnlyOnce() throws Exception {
         stubPublishOk();
 

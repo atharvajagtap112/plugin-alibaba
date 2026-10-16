@@ -48,6 +48,9 @@ public class Message implements io.kestra.core.models.tasks.Output {
     }
 
     private String body() throws JsonProcessingException {
+        if (data == null) {
+            throw new IllegalArgumentException("Every message needs a `data` value: check that each row of the `from` file has a `data` field");
+        }
         if (data instanceof String s) {
             return s;
         }
