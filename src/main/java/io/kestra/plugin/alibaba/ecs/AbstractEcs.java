@@ -2,6 +2,7 @@ package io.kestra.plugin.alibaba.ecs;
 
 import com.aliyun.ecs20140526.Client;
 import com.aliyun.teaopenapi.models.Config;
+import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.runners.RunContext;
 import io.kestra.plugin.alibaba.AbstractConnection;
@@ -12,6 +13,7 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.regex.Pattern;
 
 @SuperBuilder
@@ -21,27 +23,43 @@ import java.util.regex.Pattern;
 @NoArgsConstructor
 public abstract class AbstractEcs extends AbstractConnection {
     private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
+    static final int MAX_INSTANCE_IDS = 100;
+    static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
     protected String rRegion(RunContext runContext) throws IllegalVariableEvaluationException {
-        var regionId = renderedRegion(runContext);
-        if (!REGION_PATTERN.matcher(regionId).matches()) {
-            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + regionId);
+        var rRegion = renderedRegion(runContext);
+        if (!REGION_PATTERN.matcher(rRegion).matches()) {
+            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + rRegion);
         }
-        return regionId;
+        return rRegion;
     }
 
-    protected Client client(RunContext runContext, String regionId) throws Exception {
+    protected static void checkInstanceIdCount(java.util.List<String> rInstanceIds) {
+        if (rInstanceIds.size() > MAX_INSTANCE_IDS) {
+            throw new IllegalArgumentException("`instanceIds` accepts at most " + MAX_INSTANCE_IDS + " IDs, got " + rInstanceIds.size());
+        }
+    }
+
+    protected RuntimeOptions runtimeOptions(RunContext runContext) throws IllegalVariableEvaluationException {
+        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class).orElse(DEFAULT_READ_TIMEOUT);
+        return new RuntimeOptions()
+            .setConnectTimeout((int) CONNECT_TIMEOUT.toMillis())
+            .setReadTimeout((int) Math.min(rReadTimeout.toMillis(), Integer.MAX_VALUE));
+    }
+
+    protected Client client(RunContext runContext, String rRegion) throws Exception {
         var config = new Config()
             .setAccessKeyId(renderedAccessKeyId(runContext))
             .setAccessKeySecret(renderedAccessKeySecret(runContext))
             .setSecurityToken(renderedSecurityToken(runContext))
-            .setRegionId(regionId);
+            .setRegionId(rRegion);
 
-        var override = renderedEndpoint(runContext);
-        if (override == null) {
-            config.setEndpoint("ecs." + regionId + ".aliyuncs.com");
+        var rEndpointOverride = renderedEndpoint(runContext);
+        if (rEndpointOverride == null) {
+            config.setEndpoint("ecs." + rRegion + ".aliyuncs.com");
         } else {
-            var uri = endpointUri(override);
+            var uri = endpointUri(rEndpointOverride);
             if (uri.getScheme().equals("http")) {
                 runContext.logger().warn("`endpointOverride` uses plain http, credentials and signed requests are sent unencrypted to {}", uri.getAuthority());
             }

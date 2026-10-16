@@ -3,7 +3,6 @@ package io.kestra.plugin.alibaba.ecs;
 import com.aliyun.ecs20140526.Client;
 import com.aliyun.ecs20140526.models.StartInstancesRequest;
 import com.aliyun.tea.TeaModel;
-import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.runners.RunContext;
@@ -54,10 +53,10 @@ public class Start extends AbstractInstanceAction {
     }
 
     @Override
-    protected TeaModel call(RunContext runContext, Client client, String regionId, List<String> ids) throws Exception {
+    protected TeaModel call(RunContext runContext, Client client, String rRegion, List<String> rInstanceIds) throws Exception {
         var request = new StartInstancesRequest()
-            .setRegionId(regionId)
-            .setInstanceId(ids);
-        return client.startInstancesWithOptions(request, new RuntimeOptions()).getBody();
+            .setRegionId(rRegion)
+            .setInstanceId(rInstanceIds);
+        return client.startInstancesWithOptions(request, runtimeOptions(runContext)).getBody();
     }
 }

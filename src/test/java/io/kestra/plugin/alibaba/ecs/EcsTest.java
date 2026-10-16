@@ -2,20 +2,24 @@ package io.kestra.plugin.alibaba.ecs;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.matching.StringValuePattern;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.common.FetchType;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.serializers.FileSerde;
 import io.kestra.core.utils.IdUtils;
+import io.kestra.plugin.alibaba.AbstractConnection;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.stream.IntStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.absent;
@@ -58,17 +62,10 @@ class EcsTest {
         stubAction("DescribeInstances", absent(), 200, describeBody("page-2", "i-1", "web-1", "Running"));
         stubAction("DescribeInstances", equalTo("page-2"), 200, describeBody("", "i-2", "web-2", "Stopped"));
 
-        var task = List.builder()
-            .id(IdUtils.create())
-            .type(List.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
+        var output = connected(List.builder(), List.class)
             .status(Property.ofValue(List.Status.RUNNING))
-            .build();
-
-        var output = task.run(runContextFactory.of(Map.of()));
+            .build()
+            .run(runContextFactory.of(Map.of()));
 
         assertThat(output.getSize(), is(2L));
         assertThat(output.getRows(), hasSize(2));
@@ -85,18 +82,11 @@ class EcsTest {
         stubAction("DescribeInstances", absent(), 200, describeBody("", "i-1", "web-1", "Running"));
 
         var runContext = runContextFactory.of(Map.of());
-        var task = List.builder()
-            .id(IdUtils.create())
-            .type(List.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
+        var output = connected(List.builder(), List.class)
             .instanceIds(Property.ofValue(java.util.List.of("i-1")))
             .fetchType(Property.ofValue(FetchType.STORE))
-            .build();
-
-        var output = task.run(runContext);
+            .build()
+            .run(runContext);
 
         assertThat(output.getSize(), is(1L));
         assertThat(output.getRows(), nullValue());
@@ -114,37 +104,63 @@ class EcsTest {
     void listFetchOneReportsOneRow() throws Exception {
         stubAction("DescribeInstances", absent(), 200, describeBody("page-2", "i-1", "web-1", "Running"));
 
-        var output = List.builder()
-            .id(IdUtils.create())
-            .type(List.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
+        var output = connected(List.builder(), List.class)
             .fetchType(Property.ofValue(FetchType.FETCH_ONE))
             .build()
             .run(runContextFactory.of(Map.of()));
 
         assertThat(output.getSize(), is(1L));
         assertThat(((Map<?, ?>) output.getRow()).get("InstanceId"), is("i-1"));
-        // the first page is enough, the next one is never requested
         wireMock.verify(1, anyRequestedFor(urlPathEqualTo("/")));
+    }
+
+    @Test
+    void listNoneOnlyCounts() throws Exception {
+        stubAction("DescribeInstances", absent(), 200, describeBody("page-2", "i-1", "web-1", "Running"));
+        stubAction("DescribeInstances", equalTo("page-2"), 200, describeBody("", "i-2", "web-2", "Stopped"));
+
+        var output = connected(List.builder(), List.class)
+            .fetchType(Property.ofValue(FetchType.NONE))
+            .build()
+            .run(runContextFactory.of(Map.of()));
+
+        assertThat(output.getSize(), is(2L));
+        assertThat(output.getRows(), nullValue());
+        assertThat(output.getRow(), nullValue());
+        assertThat(output.getUri(), nullValue());
+    }
+
+    @Test
+    void listFiltersByInstanceName() throws Exception {
+        stubAction("DescribeInstances", absent(), 200, describeBody("", "i-1", "web-1", "Running"));
+
+        connected(List.builder(), List.class)
+            .instanceName(Property.ofValue("web-*"))
+            .build()
+            .run(runContextFactory.of(Map.of()));
+
+        wireMock.verify(anyRequestedFor(urlPathEqualTo("/"))
+            .withQueryParam("InstanceName", equalTo("web-*")));
+    }
+
+    @Test
+    void listRejectsMoreThan100InstanceIds() {
+        var ids = IntStream.rangeClosed(1, 101).mapToObj(i -> "i-" + i).toList();
+        var task = connected(List.builder(), List.class)
+            .instanceIds(Property.ofValue(ids))
+            .build();
+
+        var e = assertThrows(IllegalArgumentException.class, () -> task.run(runContextFactory.of(Map.of())));
+
+        assertThat(e.getMessage(), is("`instanceIds` accepts at most 100 IDs, got 101"));
+        wireMock.verify(0, anyRequestedFor(urlPathEqualTo("/")));
     }
 
     @Test
     void start() throws Exception {
         stubAction("StartInstances", absent(), 200, actionBody("i-1", "200", "Stopped", "Starting"));
 
-        var output = Start.builder()
-            .id(IdUtils.create())
-            .type(Start.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
-            .instanceIds(Property.ofValue(java.util.List.of("i-1")))
-            .build()
-            .run(runContextFactory.of(Map.of()));
+        var output = startTask("cn-hangzhou").run(runContextFactory.of(Map.of()));
 
         assertThat(output.getRequestId(), is("req-1"));
         assertThat(output.getInstances(), hasSize(1));
@@ -160,13 +176,7 @@ class EcsTest {
     void stop() throws Exception {
         stubAction("StopInstances", absent(), 200, actionBody("i-1", "200", "Running", "Stopping"));
 
-        var output = Stop.builder()
-            .id(IdUtils.create())
-            .type(Stop.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
+        var output = connected(Stop.builder(), Stop.class)
             .instanceIds(Property.ofValue(java.util.List.of("i-1")))
             .forceStop(Property.ofValue(true))
             .stoppedMode(Property.ofValue(Stop.StoppedMode.STOP_CHARGING))
@@ -184,13 +194,7 @@ class EcsTest {
     void reboot() throws Exception {
         stubAction("RebootInstances", absent(), 200, actionBody("i-1", "200", "Running", "Stopping"));
 
-        var output = Reboot.builder()
-            .id(IdUtils.create())
-            .type(Reboot.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpointOverride(Property.ofValue(endpoint()))
+        var output = connected(Reboot.builder(), Reboot.class)
             .instanceIds(Property.ofValue(java.util.List.of("i-1")))
             .build()
             .run(runContextFactory.of(Map.of()));
@@ -220,6 +224,22 @@ class EcsTest {
 
         assertThat(e.getMessage(), containsString("i-1 (IncorrectInstanceStatus"));
         assertThat(e.getMessage(), containsString("Accepted instances: []"));
+        assertThat(e.getMessage(), containsString("re-run with only their IDs"));
+    }
+
+    @Test
+    void failsWithAClearMessageOnReadTimeout() {
+        wireMock.stubFor(any(urlPathEqualTo("/")).willReturn(aResponse().withStatus(200).withFixedDelay(3000)
+            .withHeader("Content-Type", "application/json").withBody(actionBody("i-1", "200", "Stopped", "Starting"))));
+        var task = connected(Start.builder(), Start.class)
+            .instanceIds(Property.ofValue(java.util.List.of("i-1")))
+            .timeout(Property.ofValue(Duration.ofSeconds(1)))
+            .build();
+
+        var e = assertThrows(IllegalStateException.class, () -> task.run(runContextFactory.of(Map.of())));
+
+        assertThat(e.getMessage(), containsString("No response to the start request for instances [i-1] in cn-hangzhou"));
+        assertThat(e.getMessage(), containsString("check the instance status before retrying"));
     }
 
     @Test
@@ -238,12 +258,7 @@ class EcsTest {
 
     @Test
     void rejectsNonHttpEndpoint() {
-        var task = Start.builder()
-            .id(IdUtils.create())
-            .type(Start.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .region(Property.ofValue("cn-hangzhou"))
+        var task = connected(Start.builder(), Start.class)
             .endpointOverride(Property.ofValue("ftp://127.0.0.1"))
             .instanceIds(Property.ofValue(java.util.List.of("i-1")))
             .build();
@@ -254,22 +269,24 @@ class EcsTest {
     }
 
     private Start startTask(String region) {
-        return Start.builder()
-            .id(IdUtils.create())
-            .type(Start.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
+        return connected(Start.builder(), Start.class)
             .region(region == null ? null : Property.ofValue(region))
-            .endpointOverride(Property.ofValue(endpoint()))
             .instanceIds(Property.ofValue(java.util.List.of("i-1")))
             .build();
     }
 
-    private static String endpoint() {
-        return "http://127.0.0.1:" + wireMock.port();
+    private static <B extends AbstractConnection.AbstractConnectionBuilder<?, ?>> B connected(B builder, Class<?> type) {
+        builder
+            .id(IdUtils.create())
+            .type(type.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue("http://127.0.0.1:" + wireMock.port()));
+        return builder;
     }
 
-    private static void stubAction(String action, com.github.tomakehurst.wiremock.matching.StringValuePattern nextToken, int status, String body) {
+    private static void stubAction(String action, StringValuePattern nextToken, int status, String body) {
         wireMock.stubFor(any(urlPathEqualTo("/"))
             .withHeader("x-acs-action", equalTo(action))
             .withQueryParam("NextToken", nextToken)

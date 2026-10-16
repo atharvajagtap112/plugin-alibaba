@@ -3,7 +3,6 @@ package io.kestra.plugin.alibaba.ecs;
 import com.aliyun.ecs20140526.Client;
 import com.aliyun.ecs20140526.models.StopInstancesRequest;
 import com.aliyun.tea.TeaModel;
-import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -72,13 +71,15 @@ public class Stop extends AbstractInstanceAction {
     }
 
     @Override
-    protected TeaModel call(RunContext runContext, Client client, String regionId, List<String> ids) throws Exception {
+    protected TeaModel call(RunContext runContext, Client client, String rRegion, List<String> rInstanceIds) throws Exception {
+        var rForceStop = runContext.render(this.forceStop).as(Boolean.class).orElse(false);
+        var rStoppedMode = runContext.render(this.stoppedMode).as(StoppedMode.class).map(m -> m.value).orElse(null);
         var request = new StopInstancesRequest()
-            .setRegionId(regionId)
-            .setInstanceId(ids)
-            .setForceStop(runContext.render(this.forceStop).as(Boolean.class).orElse(false))
-            .setStoppedMode(runContext.render(this.stoppedMode).as(StoppedMode.class).map(m -> m.value).orElse(null));
-        return client.stopInstancesWithOptions(request, new RuntimeOptions()).getBody();
+            .setRegionId(rRegion)
+            .setInstanceId(rInstanceIds)
+            .setForceStop(rForceStop)
+            .setStoppedMode(rStoppedMode);
+        return client.stopInstancesWithOptions(request, runtimeOptions(runContext)).getBody();
     }
 
     public enum StoppedMode {

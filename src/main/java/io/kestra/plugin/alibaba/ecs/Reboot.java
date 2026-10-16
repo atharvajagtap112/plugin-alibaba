@@ -3,7 +3,6 @@ package io.kestra.plugin.alibaba.ecs;
 import com.aliyun.ecs20140526.Client;
 import com.aliyun.ecs20140526.models.RebootInstancesRequest;
 import com.aliyun.tea.TeaModel;
-import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -64,11 +63,12 @@ public class Reboot extends AbstractInstanceAction {
     }
 
     @Override
-    protected TeaModel call(RunContext runContext, Client client, String regionId, List<String> ids) throws Exception {
+    protected TeaModel call(RunContext runContext, Client client, String rRegion, List<String> rInstanceIds) throws Exception {
+        var rForceReboot = runContext.render(this.forceReboot).as(Boolean.class).orElse(false);
         var request = new RebootInstancesRequest()
-            .setRegionId(regionId)
-            .setInstanceId(ids)
-            .setForceReboot(runContext.render(this.forceReboot).as(Boolean.class).orElse(false));
-        return client.rebootInstancesWithOptions(request, new RuntimeOptions()).getBody();
+            .setRegionId(rRegion)
+            .setInstanceId(rInstanceIds)
+            .setForceReboot(rForceReboot);
+        return client.rebootInstancesWithOptions(request, runtimeOptions(runContext)).getBody();
     }
 }

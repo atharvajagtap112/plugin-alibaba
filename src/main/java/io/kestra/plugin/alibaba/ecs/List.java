@@ -4,6 +4,7 @@ import com.aliyun.ecs20140526.Client;
 import com.aliyun.ecs20140526.models.DescribeInstancesRequest;
 import com.aliyun.ecs20140526.models.DescribeInstancesResponseBody;
 import com.aliyun.tea.TeaException;
+import com.aliyun.tea.TeaUnretryableException;
 import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
@@ -25,8 +26,8 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
 import java.io.BufferedOutputStream;
-import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Map;
 
@@ -114,72 +115,91 @@ public class List extends AbstractEcs implements RunnableTask<FetchOutput> {
     private Property<FetchType> fetchType = Property.ofValue(FetchType.FETCH);
 
     @Override
-    @SuppressWarnings("unchecked")
     public FetchOutput run(RunContext runContext) throws Exception {
-        var regionId = rRegion(runContext);
-        var client = client(runContext, regionId);
-
-        var ids = runContext.render(this.instanceIds).asList(String.class);
-        var request = new DescribeInstancesRequest()
-            .setRegionId(regionId)
-            .setMaxResults(PAGE_SIZE)
-            .setInstanceIds(ids.isEmpty() ? null : JacksonMapper.ofJson().writeValueAsString(ids))
-            .setStatus(runContext.render(this.status).as(Status.class).map(Status::value).orElse(null))
-            .setInstanceName(runContext.render(this.instanceName).as(String.class).orElse(null));
-
+        var rRegion = rRegion(runContext);
+        var rInstanceIds = runContext.render(this.instanceIds).asList(String.class);
+        checkInstanceIdCount(rInstanceIds);
+        var rStatus = runContext.render(this.status).as(Status.class).map(Status::value).orElse(null);
+        var rInstanceName = runContext.render(this.instanceName).as(String.class).orElse(null);
         var rFetchType = runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.FETCH);
-        var rows = new ArrayList<Object>();
-        var count = 0L;
-        File file = null;
-        try (var output = rFetchType == FetchType.STORE ? new BufferedOutputStream(new FileOutputStream(file = runContext.workingDir().createTempFile(".ion").toFile())) : null) {
-            String nextToken = null;
-            do {
-                var body = describe(client, request.setNextToken(nextToken), regionId);
-                var page = body.getInstances() == null || body.getInstances().getInstance() == null
-                    ? java.util.List.<DescribeInstancesResponseBody.DescribeInstancesResponseBodyInstancesInstance>of()
-                    : body.getInstances().getInstance();
-                for (var instance : page) {
-                    switch (rFetchType) {
-                        case STORE -> FileSerde.write(output, instance.toMap());
-                        case FETCH -> rows.add(instance.toMap());
-                        case FETCH_ONE -> {
-                            if (rows.isEmpty()) {
-                                rows.add(instance.toMap());
-                            }
-                        }
-                        case NONE -> {
-                        }
-                    }
-                    count++;
-                }
-                nextToken = rFetchType == FetchType.FETCH_ONE && !rows.isEmpty() ? null : body.getNextToken();
-            } while (nextToken != null && !nextToken.isEmpty());
-        }
 
-        runContext.logger().debug("Found {} instance(s) in {}", count, regionId);
+        var client = client(runContext, rRegion);
+        var options = runtimeOptions(runContext);
+        var request = new DescribeInstancesRequest()
+            .setRegionId(rRegion)
+            .setMaxResults(PAGE_SIZE)
+            .setInstanceIds(rInstanceIds.isEmpty() ? null : JacksonMapper.ofJson().writeValueAsString(rInstanceIds))
+            .setStatus(rStatus)
+            .setInstanceName(rInstanceName);
 
-        // FETCH_ONE stops paging early, so it reports the rows it returns, like other fetch tasks
-        var output = FetchOutput.builder().size(rFetchType == FetchType.FETCH_ONE ? rows.size() : count);
+        var output = FetchOutput.builder();
         switch (rFetchType) {
-            case FETCH -> output.rows(rows);
-            case FETCH_ONE -> output.row(rows.isEmpty() ? null : (Map<String, Object>) rows.getFirst());
-            case STORE -> output.uri(runContext.storage().putFile(file));
-            case NONE -> {
+            case FETCH -> {
+                var rows = new ArrayList<Object>();
+                output.size(forEachInstance(client, request, options, rRegion, rows::add)).rows(rows);
             }
+            case FETCH_ONE -> {
+                var rows = new ArrayList<Map<String, Object>>();
+                output.size(forEachInstance(client, request, options, rRegion, instance -> {
+                    rows.add(instance);
+                    return false;
+                })).row(rows.isEmpty() ? null : rows.getFirst());
+            }
+            case STORE -> {
+                var file = runContext.workingDir().createTempFile(".ion").toFile();
+                try (var stream = new BufferedOutputStream(new FileOutputStream(file))) {
+                    output.size(forEachInstance(client, request, options, rRegion, instance -> {
+                        FileSerde.write(stream, instance);
+                        return true;
+                    }));
+                }
+                output.uri(runContext.storage().putFile(file));
+            }
+            case NONE -> output.size(forEachInstance(client, request, options, rRegion, instance -> true));
         }
         return output.build();
     }
 
-    private static DescribeInstancesResponseBody describe(Client client, DescribeInstancesRequest request, String regionId) throws Exception {
+    private long forEachInstance(Client client, DescribeInstancesRequest request, RuntimeOptions options, String rRegion, InstanceHandler handler) throws Exception {
+        var count = 0L;
+        String nextToken = null;
+        do {
+            var body = describe(client, request.setNextToken(nextToken), options, rRegion);
+            var page = body.getInstances() == null || body.getInstances().getInstance() == null
+                ? java.util.List.<DescribeInstancesResponseBody.DescribeInstancesResponseBodyInstancesInstance>of()
+                : body.getInstances().getInstance();
+            for (var instance : page) {
+                count++;
+                if (!handler.accept(instance.toMap())) {
+                    return count;
+                }
+            }
+            nextToken = body.getNextToken();
+        } while (nextToken != null && !nextToken.isEmpty());
+        return count;
+    }
+
+    private static DescribeInstancesResponseBody describe(Client client, DescribeInstancesRequest request, RuntimeOptions options, String rRegion) throws Exception {
         try {
-            return client.describeInstancesWithOptions(request, new RuntimeOptions()).getBody();
+            return client.describeInstancesWithOptions(request, options).getBody();
         } catch (TeaException e) {
             throw new IllegalStateException(
-                "Unable to list instances in " + regionId + " (" + e.getCode() + ": " + e.getMessage() + "): " +
+                "Unable to list instances in " + rRegion + " (" + e.getCode() + ": " + e.getMessage() + "): " +
                     "check the region and filters, and that the credentials have the ecs:DescribeInstances permission",
                 e
             );
+        } catch (TeaUnretryableException e) {
+            throw new IllegalStateException(
+                "No response when listing instances in " + rRegion + " (" + e.getMessage() + "): check network access to the ECS endpoint, or raise the task `timeout`",
+                e
+            );
         }
+    }
+
+    @FunctionalInterface
+    private interface InstanceHandler {
+        // false stops paging
+        boolean accept(Map<String, Object> instance) throws IOException;
     }
 
     public enum Status {

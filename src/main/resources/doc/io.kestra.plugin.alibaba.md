@@ -201,6 +201,8 @@ Lists the instances of a region with the [DescribeInstances](https://www.alibaba
 - Optional: `instanceIds` (up to 100), `status` (`PENDING`, `RUNNING`, `STARTING`, `STOPPING`, `STOPPED`), `instanceName` (supports `*`), `fetchType` (`FETCH` by default, `FETCH_ONE`, `STORE`, `NONE`).
 - Outputs: `rows`, `row`, `uri` or `size` depending on `fetchType`. With `STORE`, each page is written to the file as it arrives.
 
+Each ECS API call waits up to the task `timeout`, or 30 seconds when it is not set. When `Start`, `Stop` or `Reboot` gets no response in time, the request may already have been accepted, so check the instance status before retrying.
+
 ### `io.kestra.plugin.alibaba.ecs.Start`
 
 Starts stopped instances. The task returns once the request is accepted, while instances are still `Starting`.
