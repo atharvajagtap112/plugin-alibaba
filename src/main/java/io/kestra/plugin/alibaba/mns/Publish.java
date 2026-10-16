@@ -133,7 +133,11 @@ public class Publish extends AbstractMns implements RunnableTask<Publish.Output>
     private static int publishBatch(CloudQueue queue, String rQueue, List<Message> batch, int published) throws Exception {
         var messages = new ArrayList<com.aliyun.mns.model.Message>(batch.size());
         for (var message : batch) {
-            messages.add(message.toMns());
+            try {
+                messages.add(message.toMns());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(e.getMessage() + alreadyPublished(published), e);
+            }
         }
 
         try {

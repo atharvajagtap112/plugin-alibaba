@@ -192,6 +192,22 @@ class MnsTest {
     }
 
     @Test
+    void publishReportsMessagesAlreadyPublishedOnAnInvalidLaterRow() {
+        stubPublishOk();
+        var rows = new ArrayList<Object>();
+        for (var i = 0; i < 16; i++) {
+            rows.add(Map.of("data", "message-" + i));
+        }
+        rows.add(Map.of("data", "message-16", "priority", 99));
+
+        var e = assertThrows(IllegalArgumentException.class, () -> publish(Property.ofValue("cn-hangzhou"), rows).run(runContextFactory.of(Map.of())));
+
+        assertThat(e.getMessage(), containsString("`priority` must be between 1 and 16, got 99"));
+        assertThat(e.getMessage(), containsString("16 message(s) were already published, and a retry publishes them again"));
+        wireMock.verify(1, postRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
     void publishRendersInlineDataOnlyOnce() throws Exception {
         stubPublishOk();
 
@@ -451,6 +467,33 @@ class MnsTest {
 
         assertThat(received, hasSize(0));
         wireMock.verify(0, deleteRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void realtimeTriggerRetriesOnNetworkErrors() throws Exception {
+        var trigger = RealtimeTrigger.builder()
+            .id(IdUtils.create())
+            .type(RealtimeTrigger.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .region(Property.ofValue("cn-hangzhou"))
+            .endpointOverride(Property.ofValue("http://127.0.0.1:1"))
+            .queue(Property.ofValue("orders"))
+            .waitTime(Property.ofValue(Duration.ofSeconds(1)))
+            .build();
+
+        var errors = new CopyOnWriteArrayList<Throwable>();
+        var subscription = trigger.publisher(trigger.consumeTask().build(), runContextFactory.of(Map.of()))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(message -> {}, errors::add);
+        try {
+            Thread.sleep(3000);
+        } finally {
+            trigger.kill();
+            subscription.dispose();
+        }
+
+        assertThat(errors, hasSize(0));
     }
 
     @Test

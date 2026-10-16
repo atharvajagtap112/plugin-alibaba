@@ -135,7 +135,8 @@ public class RealtimeTrigger extends AbstractMnsTrigger implements RealtimeTrigg
                         handedOver.addAll(pollOnce(runContext, queue, settings, (int) Math.min(settings.rBatchSize(), requested), sink));
                         backoff = BACKOFF_BASE;
                     } catch (IllegalStateException e) {
-                        if (FATAL_ERROR_CODES.contains(errorCode(e.getCause()))) {
+                        var code = errorCode(e.getCause());
+                        if (code != null && FATAL_ERROR_CODES.contains(code)) {
                             runContext.logger().error("Stopping the trigger: {}", e.getMessage());
                             signalledError = true;
                             isActive.set(false);
