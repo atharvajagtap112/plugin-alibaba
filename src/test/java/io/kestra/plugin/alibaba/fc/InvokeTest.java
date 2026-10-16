@@ -6,6 +6,7 @@ import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.utils.IdUtils;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
@@ -13,6 +14,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -26,6 +28,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
@@ -131,6 +134,26 @@ class InvokeTest {
     }
 
     @Test
+    void inlinesBodyUpTo512Kb() throws Exception {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withBody("a".repeat(512 * 1024))));
+        var atLimit = task(Invoke.InvocationType.SYNC).run(runContext());
+        assertThat(atLimit.getBody().length(), is(512 * 1024));
+
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withBody("a".repeat(512 * 1024 + 1))));
+        var overLimit = task(Invoke.InvocationType.SYNC).run(runContext());
+        assertThat(overLimit.getBody(), nullValue());
+        assertThat(overLimit.getUri(), notNullValue());
+    }
+
+    @Test
+    void binaryResponseHasNoBody() throws Exception {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withBody(new byte[]{(byte) 0x89, 'P', 'N', 'G', (byte) 0xff})));
+        var output = task(Invoke.InvocationType.SYNC).run(runContext());
+        assertThat(output.getBody(), nullValue());
+        assertThat(output.getUri(), notNullValue());
+    }
+
+    @Test
     void failsWhenTheFunctionThrows() {
         wireMock.stubFor(post(urlPathEqualTo(PATH))
             .willReturn(aResponse()
@@ -218,16 +241,17 @@ class InvokeTest {
         return runContextFactory.of(Map.of());
     }
 
+    // deserialized like a flow is, so the payload goes through the real render path
     private static Invoke payloadTask(Object payload) {
-        return Invoke.builder()
-            .id(IdUtils.create())
-            .type(Invoke.class.getName())
-            .accessKeyId(Property.ofValue("test-id"))
-            .accessKeySecret(Property.ofValue("test-secret"))
-            .endpointOverride(Property.ofValue("http://127.0.0.1:" + wireMock.port()))
-            .functionName(Property.ofValue("resize-image"))
-            .payload(Property.ofValue(payload))
-            .build();
+        var task = new HashMap<String, Object>();
+        task.put("id", IdUtils.create());
+        task.put("type", Invoke.class.getName());
+        task.put("accessKeyId", "test-id");
+        task.put("accessKeySecret", "test-secret");
+        task.put("endpointOverride", "http://127.0.0.1:" + wireMock.port());
+        task.put("functionName", "resize-image");
+        task.put("payload", payload);
+        return JacksonMapper.ofJson().convertValue(task, Invoke.class);
     }
 
     private static Invoke task(Invoke.InvocationType type) {

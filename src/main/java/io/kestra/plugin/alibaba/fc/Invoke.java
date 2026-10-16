@@ -7,7 +7,6 @@ import com.aliyun.fc20230330.models.InvokeFunctionResponse;
 import com.aliyun.tea.TeaException;
 import com.aliyun.teaopenapi.models.Config;
 import com.aliyun.teautil.models.RuntimeOptions;
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -28,11 +27,12 @@ import lombok.experimental.SuperBuilder;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -141,7 +141,7 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
     public Output run(RunContext runContext) throws Exception {
         var function = required(runContext, this.functionName, "functionName");
         var type = runContext.render(this.invocationType).as(InvocationType.class).orElse(InvocationType.SYNC);
-        var event = render(runContext, runContext.render(this.payload).as(Object.class).orElse(null));
+        var event = runContext.render(this.payload).as(Object.class).orElse(null);
         var body = switch (event) {
             case null -> new byte[0];
             case String text -> text.getBytes(StandardCharsets.UTF_8);
@@ -183,7 +183,7 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
 
         runContext.logger().debug("Invoked function '{}' ({}), status {}, request ID {}", function, type, status, requestId);
 
-        var text = Files.size(responseFile) <= MAX_BODY_OUTPUT_BYTES ? Files.readString(responseFile, StandardCharsets.UTF_8) : null;
+        var text = Files.size(responseFile) <= MAX_BODY_OUTPUT_BYTES ? utf8(responseFile) : null;
         return Output.builder()
             .statusCode(status)
             .uri(runContext.storage().putFile(responseFile.toFile()))
@@ -192,20 +192,13 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
             .build();
     }
 
-    @SuppressWarnings("unchecked")
-    private static Object render(RunContext runContext, Object value) throws IllegalVariableEvaluationException {
-        return switch (value) {
-            case String text -> runContext.render(text);
-            case Map<?, ?> map -> runContext.render((Map<String, Object>) map);
-            case java.util.List<?> list -> {
-                var rendered = new ArrayList<Object>(list.size());
-                for (var item : list) {
-                    rendered.add(render(runContext, item));
-                }
-                yield rendered;
-            }
-            case null, default -> value;
-        };
+    // null when the response is binary (an image, a zip...), `uri` still holds it
+    private static String utf8(Path file) throws IOException {
+        try {
+            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(Files.readAllBytes(file))).toString();
+        } catch (CharacterCodingException e) {
+            return null;
+        }
     }
 
     private static String header(InvokeFunctionResponse response, String name) {
