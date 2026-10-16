@@ -200,5 +200,5 @@ Invokes a [Function Compute 3.0](https://www.alibabacloud.com/help/en/functionco
 
 - Required: `functionName`, and `accountId` unless `endpointOverride` is set.
 - Optional: `payload` (a map, list, number or boolean sent as JSON, or a string sent as is), `invocationType` (`SYNC` by default, or `ASYNC` to queue the event and return immediately), `qualifier` (version or alias, `LATEST` by default).
-- Timeout: a call waits for the response up to the task `timeout`, or 10 minutes when it is not set. For longer functions, raise `timeout` or use `ASYNC`.
+- Timeout: a call waits for the response up to 90% of the task `timeout` (so the plugin error, not the generic Kestra timeout, is shown), or 10 minutes when it is not set. For longer functions, raise `timeout` or use `ASYNC`.
 - Outputs: `statusCode`, `requestId`, `uri` (the response body in internal storage), and `body` (the response as text, only when it is at most 512 KB; empty for `ASYNC`).

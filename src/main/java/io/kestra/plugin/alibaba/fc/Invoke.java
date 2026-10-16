@@ -44,7 +44,7 @@ import java.util.Map;
 @NoArgsConstructor
 @Schema(
     title = "Invoke a Function Compute function",
-    description = "Invokes an Alibaba Cloud Function Compute 3.0 function synchronously or asynchronously and outputs the response status and body. Fails on a non-2xx response, and when the function itself throws (status 200 with an `X-Fc-Error-Type` header). A call waits for the response up to the task `timeout`, or 10 minutes when it is not set."
+    description = "Invokes an Alibaba Cloud Function Compute 3.0 function synchronously or asynchronously and outputs the response status and body. Fails on a non-2xx response, and when the function itself throws (status 200 with an `X-Fc-Error-Type` header). A call waits for the response up to 90% of the task `timeout`, so the plugin error is shown instead of the generic Kestra timeout, or 10 minutes when it is not set."
 )
 @Plugin(
     examples = {
@@ -145,7 +145,10 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
         var rQualifier = runContext.render(this.qualifier).as(String.class).orElse(DEFAULT_QUALIFIER);
         var rInvocationType = runContext.render(this.invocationType).as(InvocationType.class).orElse(InvocationType.SYNC);
         var rPayload = runContext.render(this.payload).as(Object.class).orElse(null);
-        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class).orElse(DEFAULT_READ_TIMEOUT);
+        // 90% of the task `timeout`, so the SDK fails first with the actionable message instead of Kestra's generic timeout
+        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class)
+            .map(timeout -> timeout.multipliedBy(9).dividedBy(10))
+            .orElse(DEFAULT_READ_TIMEOUT);
 
         var response = invoke(runContext, rFunctionName, rQualifier, rInvocationType, requestBody(rPayload), rReadTimeout);
         var responseFile = storeResponse(runContext, response);
