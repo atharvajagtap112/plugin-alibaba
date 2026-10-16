@@ -5,6 +5,7 @@ import com.aliyun.fc20230330.models.InvokeFunctionHeaders;
 import com.aliyun.fc20230330.models.InvokeFunctionRequest;
 import com.aliyun.fc20230330.models.InvokeFunctionResponse;
 import com.aliyun.tea.TeaException;
+import com.aliyun.tea.TeaUnretryableException;
 import com.aliyun.teaopenapi.models.Config;
 import com.aliyun.teautil.models.RuntimeOptions;
 import io.kestra.core.models.annotations.Example;
@@ -33,8 +34,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 @SuperBuilder
 @ToString
@@ -43,7 +44,7 @@ import java.util.regex.Pattern;
 @NoArgsConstructor
 @Schema(
     title = "Invoke a Function Compute function",
-    description = "Invokes an Alibaba Cloud Function Compute 3.0 function synchronously or asynchronously and outputs the response status and body. Fails on a non-2xx response, and when the function itself throws (status 200 with an `X-Fc-Error-Type` header)."
+    description = "Invokes an Alibaba Cloud Function Compute 3.0 function synchronously or asynchronously and outputs the response status and body. Fails on a non-2xx response, and when the function itself throws (status 200 with an `X-Fc-Error-Type` header). A call waits for the response up to the task `timeout`, or 10 minutes when it is not set."
 )
 @Plugin(
     examples = {
@@ -93,8 +94,9 @@ import java.util.regex.Pattern;
     }
 )
 public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Output> {
-    private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
-    private static final Pattern ACCOUNT_PATTERN = Pattern.compile("^[0-9]+$");
+    private static final String DEFAULT_QUALIFIER = "LATEST";
+    private static final Duration DEFAULT_READ_TIMEOUT = Duration.ofMinutes(10);
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     // well below Kestra 2.0's default 1 MiB queue message limit, which the whole task result must fit in
     private static final int MAX_BODY_OUTPUT_BYTES = 512 * 1024;
     private static final int MAX_ERROR_EXCERPT_BYTES = 1024;
@@ -139,61 +141,84 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        var function = required(runContext, this.functionName, "functionName");
-        var type = runContext.render(this.invocationType).as(InvocationType.class).orElse(InvocationType.SYNC);
-        var event = runContext.render(this.payload).as(Object.class).orElse(null);
-        var body = switch (event) {
+        var rFunctionName = required(runContext, this.functionName, "functionName");
+        var rQualifier = runContext.render(this.qualifier).as(String.class).orElse(DEFAULT_QUALIFIER);
+        var rInvocationType = runContext.render(this.invocationType).as(InvocationType.class).orElse(InvocationType.SYNC);
+        var rPayload = runContext.render(this.payload).as(Object.class).orElse(null);
+        var rReadTimeout = runContext.render(this.getTimeout()).as(Duration.class).orElse(DEFAULT_READ_TIMEOUT);
+
+        var response = invoke(runContext, rFunctionName, rQualifier, rInvocationType, requestBody(rPayload), rReadTimeout);
+        var responseFile = storeResponse(runContext, response);
+        var requestId = header(response, "x-fc-request-id");
+        checkResponse(rFunctionName, response, requestId, responseFile);
+
+        runContext.logger().debug("Invoked function '{}' ({}), status {}, request ID {}", rFunctionName, rInvocationType, response.getStatusCode(), requestId);
+
+        var body = Files.size(responseFile) <= MAX_BODY_OUTPUT_BYTES ? textOrNull(responseFile) : null;
+        return Output.builder()
+            .statusCode(response.getStatusCode())
+            .uri(runContext.storage().putFile(responseFile.toFile()))
+            .body(body)
+            .requestId(requestId)
+            .build();
+    }
+
+    private static byte[] requestBody(Object rPayload) throws IOException {
+        return switch (rPayload) {
             case null -> new byte[0];
             case String text -> text.getBytes(StandardCharsets.UTF_8);
-            default -> JacksonMapper.ofJson().writeValueAsBytes(event);
+            default -> JacksonMapper.ofJson().writeValueAsBytes(rPayload);
         };
+    }
 
+    private InvokeFunctionResponse invoke(RunContext runContext, String rFunctionName, String rQualifier, InvocationType rInvocationType, byte[] body, Duration rReadTimeout) throws Exception {
         var request = new InvokeFunctionRequest()
             .setBody(new ByteArrayInputStream(body))
-            .setQualifier(runContext.render(this.qualifier).as(String.class).orElse(null));
+            .setQualifier(rQualifier);
         var headers = new InvokeFunctionHeaders()
-            .setXFcInvocationType(type == InvocationType.SYNC ? "Sync" : "Async");
+            .setXFcInvocationType(rInvocationType == InvocationType.SYNC ? "Sync" : "Async");
+        var options = new RuntimeOptions()
+            .setConnectTimeout((int) CONNECT_TIMEOUT.toMillis())
+            .setReadTimeout((int) Math.min(rReadTimeout.toMillis(), Integer.MAX_VALUE));
 
-        InvokeFunctionResponse response;
         try {
-            response = client(runContext).invokeFunctionWithOptions(function, request, headers, new RuntimeOptions());
+            return client(runContext).invokeFunctionWithOptions(rFunctionName, request, headers, options);
         } catch (TeaException e) {
-            throw new IllegalStateException(failure(function, e.getStatusCode(), e.getCode() + ": " + e.getMessage()), e);
+            throw new IllegalStateException(failure(rFunctionName, e.getStatusCode(), e.getCode() + ": " + e.getMessage()), e);
+        } catch (TeaUnretryableException e) {
+            throw new IllegalStateException(
+                "Function Compute invocation of '" + rFunctionName + "' got no response (" + e.getMessage() + "): check network access to the endpoint. " +
+                    "If the function runs longer than " + rReadTimeout + ", raise the task `timeout` or use `invocationType: ASYNC`",
+                e
+            );
         }
+    }
 
-        int status = response.getStatusCode();
+    private static Path storeResponse(RunContext runContext, InvokeFunctionResponse response) throws IOException {
         var responseFile = runContext.workingDir().createTempFile();
         if (response.getBody() != null) {
             try (var stream = response.getBody()) {
                 Files.copy(stream, responseFile, StandardCopyOption.REPLACE_EXISTING);
             }
         }
+        return responseFile;
+    }
 
-        if (status < 200 || status >= 300) {
-            throw new IllegalStateException(failure(function, status, excerpt(responseFile)));
+    private static void checkResponse(String rFunctionName, InvokeFunctionResponse response, String requestId, Path responseFile) throws IOException {
+        var status = response.getStatusCode();
+        if (status == null || status < 200 || status >= 300) {
+            throw new IllegalStateException(failure(rFunctionName, status, excerpt(responseFile)));
         }
 
-        var requestId = header(response, "x-fc-request-id");
         var errorType = header(response, "x-fc-error-type");
         if (errorType != null) {
             throw new IllegalStateException(
-                "Function '" + function + "' failed with " + errorType + " (request ID " + requestId + "): " + excerpt(responseFile)
+                "Function '" + rFunctionName + "' failed with " + errorType + " (" + excerpt(responseFile) + "): check the function logs for request ID " + requestId
             );
         }
-
-        runContext.logger().debug("Invoked function '{}' ({}), status {}, request ID {}", function, type, status, requestId);
-
-        var text = Files.size(responseFile) <= MAX_BODY_OUTPUT_BYTES ? utf8(responseFile) : null;
-        return Output.builder()
-            .statusCode(status)
-            .uri(runContext.storage().putFile(responseFile.toFile()))
-            .body(text)
-            .requestId(requestId)
-            .build();
     }
 
-    // null when the response is binary (an image, a zip...), `uri` still holds it
-    private static String utf8(Path file) throws IOException {
+    private static String textOrNull(Path file) throws IOException {
         try {
             return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(Files.readAllBytes(file))).toString();
         } catch (CharacterCodingException e) {
@@ -220,9 +245,22 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
         }
     }
 
-    private static String failure(String function, Integer status, String detail) {
-        return "Function Compute invocation of '" + function + "' failed with status " + status + " (" + detail + "): " +
-            "check that the function exists in this region and account, and that the credentials have the fc:InvokeFunction permission";
+    private static String failure(String rFunctionName, Integer status, String detail) {
+        var prefix = "Function Compute invocation of '" + rFunctionName + "' failed" + (status == null ? "" : " with status " + status);
+        return prefix + " (" + detail + "): " + hint(status);
+    }
+
+    private static String hint(Integer status) {
+        if (status == null) {
+            return "check network access to the Function Compute endpoint";
+        }
+        return switch (status) {
+            case 400 -> "check that the payload and qualifier are valid for this function";
+            case 401, 403 -> "check the credentials and that they have the fc:InvokeFunction permission";
+            case 404 -> "check that the function and qualifier exist in this region and account";
+            case 429 -> "the function is throttled, retry later or raise its concurrency limit";
+            default -> status >= 500 ? "Function Compute returned a service error, retry later" : "check the request against the Function Compute API reference";
+        };
     }
 
     private Client client(RunContext runContext) throws Exception {
@@ -231,42 +269,15 @@ public class Invoke extends AbstractConnection implements RunnableTask<Invoke.Ou
             .setAccessKeySecret(renderedAccessKeySecret(runContext))
             .setSecurityToken(renderedSecurityToken(runContext));
 
-        var override = renderedEndpoint(runContext);
-        if (override != null) {
-            var uri = endpointUri(override);
-            if (uri.getScheme().equals("http")) {
-                runContext.logger().warn("`endpointOverride` uses plain http, credentials and signed requests are sent unencrypted to {}", uri.getAuthority());
-            }
-            config.setProtocol(uri.getScheme()).setEndpoint(uri.getAuthority());
+        var rEndpointOverride = rEndpointOverride(runContext, this);
+        if (rEndpointOverride != null) {
+            config.setProtocol(rEndpointOverride.getScheme()).setEndpoint(rEndpointOverride.getAuthority());
         } else {
-            var regionId = runContext.render(this.region).as(String.class)
-                .orElseThrow(() -> new IllegalArgumentException("Either `region` or `endpointOverride` must be set"));
-            if (!REGION_PATTERN.matcher(regionId).matches()) {
-                throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + regionId);
-            }
-            var account = required(runContext, this.accountId, "accountId");
-            if (!ACCOUNT_PATTERN.matcher(account).matches()) {
-                throw new IllegalArgumentException("`accountId` must only contain digits, got: " + account);
-            }
-            config.setRegionId(regionId).setEndpoint(account + "." + regionId + ".fc.aliyuncs.com");
+            var rRegion = rRegion(runContext, this);
+            var rAccountId = rAccountId(runContext, this.accountId, "accountId");
+            config.setRegionId(rRegion).setEndpoint(rAccountId + "." + rRegion + ".fc.aliyuncs.com");
         }
-
         return new Client(config);
-    }
-
-    private static URI endpointUri(String endpoint) {
-        URI uri;
-        try {
-            uri = URI.create(endpoint);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("`endpointOverride` is not a valid URL: " + endpoint, e);
-        }
-
-        var scheme = uri.getScheme();
-        if (uri.getHost() == null || scheme == null || !(scheme.equals("http") || scheme.equals("https"))) {
-            throw new IllegalArgumentException("`endpointOverride` must be an http or https URL, got: " + endpoint);
-        }
-        return uri;
     }
 
     public enum InvocationType {

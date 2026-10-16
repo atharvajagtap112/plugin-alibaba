@@ -14,6 +14,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -64,12 +66,15 @@ class InvokeTest {
                 .withHeader("x-fc-request-id", "req-1")
                 .withBody("{\"resized\":true}")));
 
-        Invoke.Output output = task(Invoke.InvocationType.SYNC).run(runContext());
+        var runContext = runContext();
+        var output = task(Invoke.InvocationType.SYNC).run(runContext);
 
         assertThat(output.getStatusCode(), is(200));
         assertThat(output.getBody(), is("{\"resized\":true}"));
         assertThat(output.getRequestId(), is("req-1"));
-        assertThat(output.getUri(), notNullValue());
+        try (var stream = runContext.storage().getFile(output.getUri())) {
+            assertThat(new String(stream.readAllBytes(), StandardCharsets.UTF_8), is("{\"resized\":true}"));
+        }
         wireMock.verify(postRequestedFor(urlPathEqualTo(PATH))
             .withHeader("x-fc-invocation-type", equalTo("Sync"))
             .withRequestBody(equalToJson("{\"key\":\"landing/photo.png\"}")));
@@ -80,7 +85,7 @@ class InvokeTest {
         wireMock.stubFor(post(urlPathEqualTo(PATH))
             .willReturn(aResponse().withStatus(202).withHeader("x-fc-request-id", "req-2")));
 
-        Invoke.Output output = task(Invoke.InvocationType.ASYNC).run(runContext());
+        var output = task(Invoke.InvocationType.ASYNC).run(runContext());
 
         assertThat(output.getStatusCode(), is(202));
         assertThat(output.getRequestId(), is("req-2"));
@@ -96,10 +101,11 @@ class InvokeTest {
                 .withHeader("Content-Type", "application/json")
                 .withBody("{\"Code\":\"FunctionNotFound\",\"Message\":\"function not found\",\"RequestId\":\"req-3\"}")));
 
-        Exception e = assertThrows(Exception.class, () -> task(Invoke.InvocationType.SYNC).run(runContext()));
+        var e = assertThrows(IllegalStateException.class, () -> task(Invoke.InvocationType.SYNC).run(runContext()));
 
         assertThat(e.getMessage(), containsString("resize-image"));
         assertThat(e.getMessage(), containsString("404"));
+        assertThat(e.getMessage(), containsString("function and qualifier exist"));
     }
 
     @Test
@@ -154,6 +160,38 @@ class InvokeTest {
     }
 
     @Test
+    void failsWithAClearMessageOnReadTimeout() {
+        wireMock.stubFor(post(urlPathEqualTo(PATH)).willReturn(aResponse().withStatus(200).withFixedDelay(3000).withBody("late")));
+        var task = Invoke.builder()
+            .id(IdUtils.create())
+            .type(Invoke.class.getName())
+            .accessKeyId(Property.ofValue("test-id"))
+            .accessKeySecret(Property.ofValue("test-secret"))
+            .endpointOverride(Property.ofValue("http://127.0.0.1:" + wireMock.port()))
+            .functionName(Property.ofValue("resize-image"))
+            .timeout(Property.ofValue(Duration.ofSeconds(1)))
+            .build();
+
+        var e = assertThrows(IllegalStateException.class, () -> task.run(runContext()));
+
+        assertThat(e.getMessage(), containsString("resize-image"));
+        assertThat(e.getMessage(), containsString("raise the task `timeout`"));
+    }
+
+    @Test
+    void failsOnThrottling() {
+        wireMock.stubFor(post(urlPathEqualTo(PATH))
+            .willReturn(aResponse()
+                .withStatus(429)
+                .withHeader("Content-Type", "application/json")
+                .withBody("{\"Code\":\"TooManyRequests\",\"Message\":\"throttled\",\"RequestId\":\"req-6\"}")));
+
+        var e = assertThrows(IllegalStateException.class, () -> task(Invoke.InvocationType.SYNC).run(runContext()));
+
+        assertThat(e.getMessage(), containsString("throttled, retry later"));
+    }
+
+    @Test
     void failsWhenTheFunctionThrows() {
         wireMock.stubFor(post(urlPathEqualTo(PATH))
             .willReturn(aResponse()
@@ -166,6 +204,7 @@ class InvokeTest {
 
         assertThat(e.getMessage(), containsString("UnhandledInvocationError"));
         assertThat(e.getMessage(), containsString("boom"));
+        assertThat(e.getMessage(), containsString("check the function logs for request ID req-5"));
     }
 
     @Test
