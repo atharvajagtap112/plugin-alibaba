@@ -116,7 +116,7 @@ public class List extends AbstractEcs implements RunnableTask<FetchOutput> {
 
     @Override
     public FetchOutput run(RunContext runContext) throws Exception {
-        var rRegion = rRegion(runContext);
+        var rRegion = requiredRegion(runContext);
         var rInstanceIds = runContext.render(this.instanceIds).asList(String.class);
         checkInstanceIdCount(rInstanceIds);
         var rStatus = runContext.render(this.status).as(Status.class).map(Status::value).orElse(null);

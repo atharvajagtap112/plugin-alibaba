@@ -41,7 +41,7 @@ public abstract class AbstractInstanceAction extends AbstractEcs implements Runn
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        var rRegion = rRegion(runContext);
+        var rRegion = requiredRegion(runContext);
         var rInstanceIds = runContext.render(this.instanceIds).asList(String.class);
         if (rInstanceIds.isEmpty()) {
             throw new IllegalArgumentException("`instanceIds` is required");

@@ -12,9 +12,8 @@ import lombok.NoArgsConstructor;
 import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
-import java.net.URI;
 import java.time.Duration;
-import java.util.regex.Pattern;
+import java.util.Locale;
 
 @SuperBuilder
 @ToString
@@ -22,17 +21,14 @@ import java.util.regex.Pattern;
 @Getter
 @NoArgsConstructor
 public abstract class AbstractEcs extends AbstractConnection {
-    private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
     static final int MAX_INSTANCE_IDS = 100;
     static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
-    protected String rRegion(RunContext runContext) throws IllegalVariableEvaluationException {
-        var rRegion = renderedRegion(runContext);
-        if (!REGION_PATTERN.matcher(rRegion).matches()) {
-            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + rRegion);
-        }
-        return rRegion;
+    // ECS sends the region as `RegionId` in every request, so unlike the other services it stays required with `endpointOverride`
+    protected String requiredRegion(RunContext runContext) throws IllegalVariableEvaluationException {
+        renderedRegion(runContext);
+        return rRegion(runContext, this);
     }
 
     protected static void checkInstanceIdCount(java.util.List<String> rInstanceIds) {
@@ -58,32 +54,13 @@ public abstract class AbstractEcs extends AbstractConnection {
             .setSecurityToken(renderedSecurityToken(runContext))
             .setRegionId(rRegion);
 
-        var rEndpointOverride = renderedEndpoint(runContext);
+        var rEndpointOverride = rEndpointOverride(runContext, this);
         if (rEndpointOverride == null) {
             config.setEndpoint("ecs." + rRegion + ".aliyuncs.com");
         } else {
-            var uri = endpointUri(rEndpointOverride);
-            if (uri.getScheme().equals("http")) {
-                runContext.logger().warn("`endpointOverride` uses plain http, credentials and signed requests are sent unencrypted to {}", uri.getAuthority());
-            }
-            config.setProtocol(uri.getScheme()).setEndpoint(uri.getAuthority());
+            config.setProtocol(rEndpointOverride.getScheme().toLowerCase(Locale.ROOT)).setEndpoint(rEndpointOverride.getAuthority());
         }
 
         return new Client(config);
-    }
-
-    private static URI endpointUri(String endpoint) {
-        URI uri;
-        try {
-            uri = URI.create(endpoint);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("`endpointOverride` is not a valid URL: " + endpoint, e);
-        }
-
-        var scheme = uri.getScheme();
-        if (uri.getHost() == null || scheme == null || !(scheme.equals("http") || scheme.equals("https"))) {
-            throw new IllegalArgumentException("`endpointOverride` must be an http or https URL, got: " + endpoint);
-        }
-        return uri;
     }
 }
