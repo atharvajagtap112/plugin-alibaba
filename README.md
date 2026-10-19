@@ -44,6 +44,7 @@
 - MaxCompute: `Query` runs SQL with fetch/store modes and remote cancellation; `Trigger` tracks new rows using typed watermarks.
 - SLS: `Query` searches logs, `Push` ingests structured data, and `Trigger` consumes new logs with persisted shard cursors.
 - Function Compute: `Invoke` calls a serverless function synchronously or asynchronously.
+- ECS: `List` lists instances, and `Start`, `Stop` and `Reboot` change their state.
 
 See [plugin documentation](src/main/resources/doc/io.kestra.plugin.alibaba.md) for connection options and examples.
 

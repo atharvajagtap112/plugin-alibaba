@@ -3,12 +3,12 @@
 ## What
 
 - Provides plugin components under `io.kestra.plugin.alibaba`.
-- Includes OSS `Upload`, `Download`, `List`, `Delete`, `Copy`, and `Trigger`, MaxCompute `Query` and `Trigger`, SLS `Query`, `Push`, and `Trigger`, and Function Compute `Invoke`.
+- Includes OSS `Upload`, `Download`, `List`, `Delete`, `Copy`, and `Trigger`, MaxCompute `Query` and `Trigger`, SLS `Query`, `Push`, and `Trigger`, Function Compute `Invoke`, and ECS `List`, `Start`, `Stop`, and `Reboot`.
 
 ## Why
 
-- This plugin integrates Kestra with Alibaba Cloud OSS, MaxCompute, Simple Log Service, and Function Compute.
-- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. MaxCompute and SLS polling triggers persist typed watermarks or shard cursors in namespace KV. Function Compute `Invoke` calls a function synchronously or asynchronously and exposes the response to downstream tasks.
+- This plugin integrates Kestra with Alibaba Cloud OSS, MaxCompute, Simple Log Service, Function Compute, and ECS.
+- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. MaxCompute and SLS polling triggers persist typed watermarks or shard cursors in namespace KV. Function Compute `Invoke` calls a function synchronously or asynchronously and exposes the response to downstream tasks. ECS tasks list, start, stop and reboot instances so flows can manage compute around their workloads.
 
 ## How
 
@@ -20,10 +20,11 @@ Single-module plugin. Source packages under `io.kestra.plugin.alibaba`:
 - `maxcompute`
 - `sls`
 - `fc`
+- `ecs`
 
-The root package holds the shared connection base (`AlibabaConnectionInterface`, `AbstractConnection`). The `oss` package holds `AbstractOss`, which builds the OSS client, and the tasks. The `fc` package holds `Invoke`, which builds its Function Compute client from the shared connection properties plus `accountId`.
+The root package holds the shared connection base (`AlibabaConnectionInterface`, `AbstractConnection`). The `oss` package holds `AbstractOss`, which builds the OSS client, and the tasks. The `fc` package holds `Invoke`, which builds its Function Compute client from the shared connection properties plus `accountId`. The `ecs` package holds `AbstractEcs`, which builds the ECS client, `AbstractInstanceAction`, shared by `Start`, `Stop` and `Reboot`, and `List`.
 
-Tests exercise OSS, MaxCompute instance/result-tunnel APIs, SLS and Function Compute endpoints through WireMock, so no cloud credentials are needed.
+Tests exercise OSS, MaxCompute instance/result-tunnel APIs, SLS, Function Compute and ECS endpoints through WireMock, so no cloud credentials are needed.
 
 ### Key Plugin Classes
 
@@ -39,6 +40,10 @@ Tests exercise OSS, MaxCompute instance/result-tunnel APIs, SLS and Function Com
 - `io.kestra.plugin.alibaba.sls.Push`
 - `io.kestra.plugin.alibaba.sls.Trigger`
 - `io.kestra.plugin.alibaba.fc.Invoke`
+- `io.kestra.plugin.alibaba.ecs.List`
+- `io.kestra.plugin.alibaba.ecs.Start`
+- `io.kestra.plugin.alibaba.ecs.Stop`
+- `io.kestra.plugin.alibaba.ecs.Reboot`
 
 ### Project Structure
 
