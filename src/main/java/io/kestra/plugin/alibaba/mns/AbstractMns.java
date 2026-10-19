@@ -20,10 +20,8 @@ import lombok.NoArgsConstructor;
 import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
-import java.net.URI;
 import java.time.Duration;
 import java.util.Locale;
-import java.util.regex.Pattern;
 
 @SuperBuilder
 @ToString
@@ -31,8 +29,6 @@ import java.util.regex.Pattern;
 @Getter
 @NoArgsConstructor
 public abstract class AbstractMns extends AbstractConnection {
-    private static final Pattern REGION_PATTERN = Pattern.compile("^[a-z0-9-]+$");
-    private static final Pattern ACCOUNT_PATTERN = Pattern.compile("^[0-9]+$");
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     // above the 30 second maximum long-poll wait of a receive request
     private static final Duration SOCKET_TIMEOUT = Duration.ofSeconds(45);
@@ -58,26 +54,14 @@ public abstract class AbstractMns extends AbstractConnection {
     }
 
     protected Client client(RunContext runContext) throws IllegalVariableEvaluationException {
-        var rRegion = renderedRegion(runContext);
-        if (!REGION_PATTERN.matcher(rRegion).matches()) {
-            throw new IllegalArgumentException("`region` must only contain lowercase letters, digits and dashes, got: " + rRegion);
-        }
+        // the SDK signs with the region, so unlike the other services it stays required with `endpointOverride`
+        renderedRegion(runContext);
+        var rRegion = rRegion(runContext, this);
 
-        var rEndpointOverride = renderedEndpoint(runContext);
-        String endpoint;
-        if (rEndpointOverride == null) {
-            var rAccountId = required(runContext, this.accountId, "accountId");
-            if (!ACCOUNT_PATTERN.matcher(rAccountId).matches()) {
-                throw new IllegalArgumentException("`accountId` must only contain digits, got: " + rAccountId);
-            }
-            endpoint = "https://" + rAccountId + ".mns." + rRegion + ".aliyuncs.com";
-        } else {
-            var uri = endpointUri(rEndpointOverride);
-            if (uri.getScheme().equals("http")) {
-                runContext.logger().warn("`endpointOverride` uses plain http, credentials and signed requests are sent unencrypted to {}", uri.getAuthority());
-            }
-            endpoint = rEndpointOverride;
-        }
+        var rEndpointOverride = rEndpointOverride(runContext, this);
+        var endpoint = rEndpointOverride == null
+            ? "https://" + rAccountId(runContext, this.accountId, "accountId") + ".mns." + rRegion + ".aliyuncs.com"
+            : rEndpointOverride.getScheme().toLowerCase(Locale.ROOT) + rEndpointOverride.toString().substring(rEndpointOverride.getScheme().length());
 
         var rAccessKeyId = renderedAccessKeyId(runContext);
         var rAccessKeySecret = renderedAccessKeySecret(runContext);
@@ -108,21 +92,6 @@ public abstract class AbstractMns extends AbstractConnection {
                 ? "requests are throttled, retry later"
                 : "look up the error code in the MNS API reference";
         };
-    }
-
-    private static URI endpointUri(String endpoint) {
-        URI uri;
-        try {
-            uri = URI.create(endpoint);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("`endpointOverride` is not a valid URL: " + endpoint, e);
-        }
-
-        var scheme = uri.getScheme();
-        if (uri.getHost() == null || scheme == null || !(scheme.equals("http") || scheme.equals("https"))) {
-            throw new IllegalArgumentException("`endpointOverride` must be an http or https URL, got: " + endpoint);
-        }
-        return uri;
     }
 
     public static final class Client implements AutoCloseable {
